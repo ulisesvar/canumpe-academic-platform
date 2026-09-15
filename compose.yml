@@ -1,0 +1,48 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-canumpe}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-canumpe}
+      POSTGRES_DB: ${POSTGRES_DB:-canumpe}
+    volumes:
+      - canumpe_pg_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-canumpe} -d ${POSTGRES_DB:-canumpe}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Always addresses the "db" service on the compose network. The
+      # host-oriented DATABASE_URL in .env (using localhost) is for local
+      # tooling running outside Docker and is intentionally not used here.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-canumpe}:${POSTGRES_PASSWORD:-canumpe}@db:5432/${POSTGRES_DB:-canumpe}
+    command: ["alembic", "upgrade", "head"]
+
+  api:
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-canumpe}:${POSTGRES_PASSWORD:-canumpe}@db:5432/${POSTGRES_DB:-canumpe}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    ports:
+      - "127.0.0.1:8000:8000"
+
+volumes:
+  canumpe_pg_data:
