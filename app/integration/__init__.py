@@ -1,5 +1,7 @@
 """Integration package.
 
-Reserved for future Moodle/Attendance extraction and synchronization
-jobs. Intentionally empty in Phase 0.
+Holds source-identity mappings (app.integration.models) that link
+canonical academic records to Moodle/Attendance source identities, plus
+pipeline observability (sync_runs, sync_state). Extraction and
+synchronization jobs themselves are not implemented yet.
 """

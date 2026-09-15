@@ -27,20 +27,108 @@ Attendance ───────┘
   never depends on Moodle or Attendance being available.
 
 **None of that integration exists yet.** This repository currently
-implements infrastructure only.
+implements infrastructure and a database foundation only.
 
-## Current phase: Phase 0 — Bootstrap
+## Current phase: Phase 1 — Academic Data Foundation
 
-Phase 0 sets up the project skeleton, tooling, and infrastructure needed for
-every later phase. It intentionally contains **no business logic**:
+Phase 0 built the project skeleton and shipped a validated production
+deployment (`GET /health` only). Phase 1 adds the **database foundation**
+for the pipeline above — schemas and canonical tables, no source
+connections and no synchronization logic yet.
 
-- No Moodle integration
-- No Attendance integration
-- No synchronization jobs
-- No academic domain tables (students, courses, enrollments, attendance,
-  grades, assignments)
-- No API authentication
-- No real API endpoints beyond `GET /health`
+### Data flow (target architecture)
+
+```
+Source (Moodle / Attendance)
+        ↓
+      RAW               landing copy of selected source entities, as-is
+        ↓
+    STAGING             normalized/validated, not yet merged
+        ↓
+    ACADEMIC            curated, canonical — the only system of record
+        ↓                for the Academic API
+       API
+```
+
+The Academic API will eventually query **only** `academic`. RAW and
+staging are internal pipeline concerns and must never be queried by the
+API.
+
+### PostgreSQL schemas
+
+| Schema | Purpose | Status in Phase 1 |
+|---|---|---|
+| `raw_moodle` | Landing representation of selected Moodle source entities, as extracted. | Empty — no tables yet |
+| `raw_attendance` | Landing representation of selected Attendance source entities, as extracted. | Empty — no tables yet |
+| `staging` | Temporary normalized/validated representation before canonical merge. Not a system of record. | Empty — no tables yet |
+| `academic` | Curated canonical data. The only schema the Academic API reads from. | `students`, `courses`, `enrollments` |
+| `integration` | Source-identity mappings and pipeline observability (never business data). | `student_sources`, `course_sources`, `enrollment_sources`, `sync_runs`, `sync_state` |
+| `auth` | Reserved for future API authentication. | Empty — no tables yet |
+
+`raw_moodle`, `raw_attendance`, `staging`, and `auth` are created now only
+to establish architectural boundaries. Entity-specific tables in them are
+intentionally **not** invented before the real Moodle/Attendance source
+models are studied in a later phase.
+
+### Architectural invariants
+
+These are load-bearing rules for every later phase, not just Phase 1:
+
+1. Moodle and Attendance are systems of record; source access will be read-only.
+2. The Academic API reads only from `academic` and must never require Moodle
+   or Attendance to be available during a request.
+3. Canonical academic ids are internally generated and independent of
+   source-system ids (a Moodle user id and an Attendance student id may both
+   map to the same `academic.students.id`). Source identifiers are stored as
+   `TEXT`, never assumed to be integers — this includes `account_number`, so
+   leading zeros are preserved.
+4. Future extraction uses a consistent snapshot where appropriate; future
+   synchronization is idempotent — reprocessing the same source data must
+   never create duplicates.
+5. A failed batch must not leave `academic` partially updated. A sync
+   watermark (`integration.sync_state`) advances only after the academic
+   merge for that batch has committed successfully.
+6. A record missing from a source extraction is not automatically a
+   deletion. Physical deletion of academic records is avoided in favor of
+   `active`/`status` fields; future sync logic explicitly decides whether a
+   record is unchanged, updated, inactive, invalid, or unexpectedly missing.
+7. Every future ingestion batch is observable and auditable via
+   `integration.sync_runs`.
+8. RAW, staging, and academic have different responsibilities and are never
+   mixed in the same table.
+
+Foreign keys between canonical tables use `ON DELETE RESTRICT`: accidental
+deletion of a referenced student, course, or enrollment fails loudly rather
+than cascading.
+
+### Timestamp maintenance
+
+`created_at` (and `first_seen_at`) may rely on a database default —
+they're set once, at insert, and a `server_default=now()` is a reasonable
+place for that.
+
+`updated_at` and `last_seen_at` are different: they get a DB default on
+insert too (so they start out equal to `created_at`/`first_seen_at`), but
+nothing keeps them current after that. There is deliberately no ORM/Core
+`onupdate` default and no database trigger. Future synchronization
+pipelines will use bulk operations, SQLAlchemy Core statements, and
+PostgreSQL `INSERT ... ON CONFLICT DO UPDATE` upserts — an `onupdate`
+default is silently skipped by upserts and by some bulk/Core execution
+paths, so correctness must not depend on it. Any code that updates a row —
+including the future sync implementation — **must set `updated_at`/
+`last_seen_at` explicitly** as part of that write. The same applies to
+`integration.sync_state.updated_at`: advancing the watermark's `state`
+column must set `updated_at` in the same write, not rely on it happening
+automatically.
+
+### What Phase 1 does not implement yet
+
+- No connection to Moodle or Attendance, and no real student data
+- No extraction or synchronization jobs (no schedulers, no timers)
+- No `raw_*`/`staging` entity tables — only the empty schemas
+- No `auth` tables and no API authentication/API keys
+- No academic API endpoints, grades, assignments, attendance, or participation
+- `GET /health` is unchanged from Phase 0
 
 ## Developer workstation vs. production host
 
@@ -65,8 +153,10 @@ GitHub source → GitHub Actions CI → Docker image build → GHCR → CANUMPE 
 The production server needs Docker, Docker Compose, `compose.yml`, and a
 `.env` file — nothing else. It never runs `pip`, `pytest`, `ruff`, `mypy`,
 or `alembic` directly from a host Python installation, and it never builds
-images itself. Image publishing to GHCR is not wired up yet; that is
-deferred to a later phase.
+images itself. `.github/workflows/release.yml` builds and publishes the
+`runtime` image to GHCR on version tags; the CANUMPE server pulls it with
+`docker compose pull && docker compose up -d`. Migrations still run from a
+container (`docker compose run --rm migrate`), never from host Alembic.
 
 ## Prerequisites
 
@@ -153,7 +243,9 @@ mypy app
 ## Validate migrations
 
 The integration test suite already proves Alembic can upgrade a fresh,
-empty database to `head` (see `tests/integration/test_alembic_migration.py`).
+empty database to `head`, that the resulting schemas/tables/constraints are
+correct, that downgrade-then-upgrade is clean, and that running
+`alembic upgrade head` twice is safe (see `tests/integration/test_migrations.py`).
 To check it manually:
 
 ```bash
@@ -187,10 +279,8 @@ completely clean slate.
 
 ## Deferred to later phases
 
-- Moodle integration
-- Attendance integration
-- Synchronization jobs
-- Academic Database schema (students, courses, enrollments, attendance,
-  grades, assignments)
-- API authentication / API keys
-- Publishing images to GHCR and pulling them on the production server
+- Moodle integration and Attendance integration (no source connections exist)
+- Extraction and synchronization jobs (schedulers, timers, watermark advancement)
+- `raw_moodle` / `raw_attendance` / `staging` entity tables
+- `auth` tables and API authentication / API keys
+- Academic API endpoints, grades, assignments, attendance, participation

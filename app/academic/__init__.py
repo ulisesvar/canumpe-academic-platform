@@ -1,5 +1,6 @@
 """Academic domain package.
 
-Reserved for future phases: students, courses, enrollments, attendance,
-grades, and assignments. Intentionally empty in Phase 0.
+Canonical academic models (students, courses, enrollments) live in
+app.academic.models. This is the only schema the future Academic API will
+read from. Attendance, grades, and assignments are not implemented yet.
 """
