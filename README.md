@@ -26,15 +26,19 @@ Attendance ───────┘
 - The public Academic API will read only from that curated database, so it
   never depends on Moodle or Attendance being available.
 
-**None of that integration exists yet.** This repository currently
-implements infrastructure and a database foundation only.
+**Attendance integration does not exist yet.** This repository currently
+implements infrastructure, a database foundation, and a Moodle ingestion
+pipeline for students/courses/enrollments only.
 
-## Current phase: Phase 1 — Academic Data Foundation
+## Current phase: Phase 2 — Moodle Ingestion
 
 Phase 0 built the project skeleton and shipped a validated production
-deployment (`GET /health` only). Phase 1 adds the **database foundation**
-for the pipeline above — schemas and canonical tables, no source
-connections and no synchronization logic yet.
+deployment (`GET /health` only). Phase 1 added the database foundation —
+schemas and canonical tables, no source connections yet. Phase 2 adds a
+working Moodle ingestion pipeline (students, courses, enrollments only):
+read-only extraction → `raw_moodle` → `staging` → validation → a
+transactional merge into `academic`. It is invoked manually, as a
+separate command — never scheduled, and never triggered by the API.
 
 ### Data flow (target architecture)
 
@@ -56,19 +60,19 @@ API.
 
 ### PostgreSQL schemas
 
-| Schema | Purpose | Status in Phase 1 |
+| Schema | Purpose | Status in Phase 2 |
 |---|---|---|
-| `raw_moodle` | Landing representation of selected Moodle source entities, as extracted. | Empty — no tables yet |
+| `raw_moodle` | Landing representation of selected Moodle source entities, as extracted — faithful, append-only, never validated. | `students`, `courses`, `enrollments` |
 | `raw_attendance` | Landing representation of selected Attendance source entities, as extracted. | Empty — no tables yet |
-| `staging` | Temporary normalized/validated representation before canonical merge. Not a system of record. | Empty — no tables yet |
+| `staging` | Normalized/validated candidate rows for one batch, rebuilt on every run. Not a system of record. | `students`, `courses`, `enrollments` |
 | `academic` | Curated canonical data. The only schema the Academic API reads from. | `students`, `courses`, `enrollments` |
 | `integration` | Source-identity mappings and pipeline observability (never business data). | `student_sources`, `course_sources`, `enrollment_sources`, `sync_runs`, `sync_state` |
 | `auth` | Reserved for future API authentication. | Empty — no tables yet |
 
-`raw_moodle`, `raw_attendance`, `staging`, and `auth` are created now only
-to establish architectural boundaries. Entity-specific tables in them are
-intentionally **not** invented before the real Moodle/Attendance source
-models are studied in a later phase.
+`raw_attendance` and `auth` remain empty — established now only for
+architectural boundaries. Entity-specific tables for Attendance are
+intentionally **not** invented before its real source model is studied in
+a later phase.
 
 ### Architectural invariants
 
@@ -121,28 +125,132 @@ including the future sync implementation — **must set `updated_at`/
 column must set `updated_at` in the same write, not rely on it happening
 automatically.
 
-### What Phase 1 does not implement yet
+### Moodle ingestion pipeline
 
-- No connection to Moodle or Attendance, and no real student data
-- No extraction or synchronization jobs (no schedulers, no timers)
-- No `raw_*`/`staging` entity tables — only the empty schemas
+```
+Moodle (read-only)
+        ↓  one REPEATABLE READ, READ ONLY transaction
+  extraction              app.integration.moodle.source
+        ↓
+  raw_moodle.*             faithful landing copy, append-only, never validated
+        ↓
+  staging.*                normalized candidates, rebuilt every run
+        ↓
+  validation               batch-wide checks (duplicates, dangling references)
+        ↓  only if zero issues
+  canonical merge           one transaction: academic.* + integration.*_sources
+        ↓
+  integration.sync_runs / sync_state
+```
+
+Implemented in `app/integration/moodle/` (`source.py`, `raw_writer.py`,
+`staging_writer.py`, `validation.py`, `merge.py`, `runs.py`, `sync.py`).
+
+**Source contract.** The account number is a Moodle custom profile field
+(`mdl_user_info_field.shortname = 'cuenta'`, joined to
+`mdl_user_info_data`) — never a hardcoded `fieldid`, and never
+`mdl_user.idnumber`. A student is only extracted if `mdl_user.deleted =
+0`; an enrollment is only extracted if both `mdl_user_enrolments.status =
+0` and `mdl_enrol.status = 0`. Course scope is `MOODLE_COURSE_ID`
+(configuration, not a hardcoded id in SQL). If the same account number
+resolves to more than one non-deleted Moodle user, extraction raises
+immediately (`MoodleSourceIntegrityError`) rather than silently picking
+one.
+
+**Consistent snapshot.** All three extraction queries (students, courses,
+enrollments) run inside one `SET TRANSACTION ISOLATION LEVEL REPEATABLE
+READ READ ONLY` transaction, so they see one coherent view of Moodle even
+if something else commits a change to Moodle mid-extraction. The
+connection is always cleanly committed (read-only, so this just releases
+the snapshot) or rolled back, and closed.
+
+**Full extraction, on purpose.** Phase 2 re-extracts the whole configured
+course scope on every run rather than tracking an incremental
+cursor/watermark. Current data volume is small, so the simplicity is
+worth more than the optimization; `integration.sync_state` already
+records the last successful batch's id/snapshot time so a later phase can
+add incremental extraction without a schema change.
+
+**Idempotency.** Change detection is by `source_hash` (a documented,
+deterministic SHA-256 over business-relevant fields only — never
+`batch_id`/`ingested_at`/`source_updated_at`; see
+`app/integration/moodle/hashing.py`). Re-running the same source state
+produces `rows_inserted=0, rows_updated=0, rows_unchanged=N` — no
+duplicate canonical rows, no duplicate `integration.*_sources` mappings.
+A student enrolled in the same course through more than one Moodle enrol
+method resolves to one canonical enrollment (`academic.enrollments` has
+`UNIQUE(student_id, course_id)`); the merge reuses the existing row
+instead of trying to insert a second one.
+
+**Transaction and failure behavior.** RAW and staging writes commit on
+their own (RAW must survive even if a later stage fails; staging is
+disposable but still worth inspecting after a failed run). Validation
+runs read-only. The canonical merge — `academic.*` writes, the
+`integration.*_sources` mapping updates, and advancing
+`integration.sync_state` — all happen in one transaction; a `sync_runs`
+row only ever reads SUCCESS once that transaction has actually committed.
+Any blocking validation issue, or any exception during the merge, aborts
+before or rolls back the merge entirely: existing academic data is never
+partially updated, and the failed run is recorded with `status=FAILED`
+and an `error_message`. The watermark in `sync_state` is only touched
+inside the merge transaction, so it never advances on a failed run.
+
+**Timestamps.** Per the Phase 1 invariant, the merge always sets
+`updated_at`/`last_seen_at`/`synced_at` explicitly (never relies on ORM
+`onupdate`) — including on the unchanged path, where `last_seen_at`/
+`synced_at` still advance because the source was observed again even
+though nothing about it changed, while `updated_at` on the canonical row
+stays put.
+
+**Missing records.** A student/enrollment absent from one extraction
+(e.g. unenrolled) is not touched — never physically deleted and never
+inferred as inactive. It simply isn't in that batch; a future phase can
+add explicit logic for "expected vs. unexpected disappearance."
+
+**Source identity.** Uses the Phase 1 mapping tables
+(`integration.student_sources`/`course_sources`/`enrollment_sources`) —
+Moodle ids are never canonical primary keys. The stable source identity
+for an enrollment is Moodle's `mdl_user_enrolments.id`.
+
+**Security boundary.** The sync command needs its own read-only Moodle
+credential (production user `academic_sync_moodle`, `SELECT` only) — the
+application never creates that user or grants privileges; that's done by
+Moodle's own administrators outside this codebase. `MOODLE_DB_URL`/
+`MOODLE_COURSE_ID` are only ever read by `app.integration.moodle.config`,
+loaded only by `app.integration.moodle.sync`'s `main()`. The public API
+(`app.core.config.Settings`) has no such fields and never receives these
+variables. In production the sync runs natively on the CANUMPE host, not
+in a container — see "Host-native operational integration jobs" below
+for the full execution model, and `docker compose run --rm moodle-sync`
+further down for the development/testing-only Docker path.
+
+### What Phase 2 does not implement yet
+
+- No connection to Attendance, and no real student data anywhere
+- No cron — scheduling is `deploy/systemd/academic-moodle-sync.timer`,
+  but it is example material, not installed/enabled anywhere yet, and
+  production cadence is not decided by this repository
+- No incremental extraction (full course-scope re-extraction every run)
+- No `raw_attendance`/`staging` entity tables for Attendance
 - No `auth` tables and no API authentication/API keys
 - No academic API endpoints, grades, assignments, attendance, or participation
-- `GET /health` is unchanged from Phase 0
+- `GET /health` is unchanged from Phase 0; the API still never queries Moodle
 
 ## Developer workstation vs. production host
 
-These are deliberately different environments:
+These are deliberately different environments. Note the one deliberate
+exception in the production column — the Moodle sync — explained in full
+in "Host-native operational integration jobs" right below this table.
 
 | | Developer workstation | Production (CANUMPE server) |
 |---|---|---|
-| Python | Optional local venv, or Docker | Never installed for this app |
-| Dependencies | `pip install .[dev]` (optional) | Baked into the Docker image only |
-| Source code | Full git checkout | Not required |
-| Build | `docker build` allowed | Never builds images |
-| Runs | `pytest`, `ruff`, `mypy`, `uvicorn --reload`, or Docker | `docker compose pull && docker compose up -d` only |
+| Python | Optional local venv, or Docker | Never installed for the API; an isolated venv exists only for the Moodle sync |
+| Dependencies | `pip install .[dev]` (optional) | API: baked into the Docker image. Moodle sync: pinned into its own venv |
+| Source code | Full git checkout | API: not required (image only). Moodle sync: an approved tagged checkout, installed into its venv — never edited in place |
+| Build | `docker build` allowed | Never builds Docker images |
+| Runs | `pytest`, `ruff`, `mypy`, `uvicorn --reload`, or Docker | API/DB: `docker compose pull && docker compose up -d`. Moodle sync: a systemd oneshot service/timer running the venv's Python natively |
 
-Production deployment model:
+Production deployment model — the API/database side:
 
 ```
 GitHub source → GitHub Actions CI → Docker image build → GHCR → CANUMPE server
@@ -150,13 +258,209 @@ GitHub source → GitHub Actions CI → Docker image build → GHCR → CANUMPE 
                                                                     → docker compose up -d
 ```
 
-The production server needs Docker, Docker Compose, `compose.yml`, and a
-`.env` file — nothing else. It never runs `pip`, `pytest`, `ruff`, `mypy`,
-or `alembic` directly from a host Python installation, and it never builds
-images itself. `.github/workflows/release.yml` builds and publishes the
+The production server needs Docker, Docker Compose, `compose.prod.yml`
+(see below), and a `.env` file for the API/database side — nothing else.
+It never runs `pip`, `pytest`, `ruff`, `mypy`, or `alembic` directly from
+a host Python installation for the API, and it never builds Docker images
+itself. `.github/workflows/release.yml` builds and publishes the
 `runtime` image to GHCR on version tags; the CANUMPE server pulls it with
-`docker compose pull && docker compose up -d`. Migrations still run from a
-container (`docker compose run --rm migrate`), never from host Alembic.
+`docker compose pull && docker compose up -d`. Migrations still run from
+a container (`docker compose run --rm migrate`), never from host Alembic.
+
+## Host-native operational integration jobs
+
+CANUMPE distinguishes two kinds of production workload:
+
+- **Applications** — normally Docker/GHCR, per the model above. The
+  Academic API and the Academic Database.
+- **Operational integration jobs** — may run natively on the host when
+  they need direct access to a *local* source system. The Moodle sync,
+  today; a future Attendance sync, potentially.
+
+**Why the Moodle sync runs on the host, not in Docker.** Moodle's
+PostgreSQL listens on `127.0.0.1` only, by design — it is not reachable
+from anywhere else, including from inside a Docker network, without
+either exposing it publicly or building a Docker-to-host networking
+workaround. Neither is acceptable. Running the sync as a native process
+on the same host as Moodle lets it reach `127.0.0.1:5432` exactly like
+any other local client, with zero change to Moodle's network exposure:
+
+```
+Moodle PostgreSQL (127.0.0.1:5432, read-only)
+        ↓
+   host-native Python sync job (systemd oneshot)
+        ↓
+Academic PostgreSQL (127.0.0.1:5434, dedicated ingest credential)
+        ↓
+   Academic API (Docker, internal network only)
+```
+
+The Academic API and Academic Database stay exactly as Dockerized as
+before — this only changes how the *sync job* runs, not the pipeline
+logic itself (extraction, RAW, staging, validation, merge, idempotency,
+and `integration.sync_runs`/`sync_state` are unchanged from Phase 2's
+implementation).
+
+### Production port convention
+
+All localhost-only, none ever bound to `0.0.0.0`, none reachable from
+the LAN or Internet:
+
+| Service | Host binding |
+|---|---|
+| Moodle PostgreSQL | `127.0.0.1:5432` (pre-existing, unowned by this repo) |
+| Academic PostgreSQL | `127.0.0.1:5434` → container `5432` |
+| Academic API | `127.0.0.1:8080` → container `8000` |
+
+These are the established production values — `compose.prod.yml` is the
+source of truth for the last two, and
+[`tests/unit/test_production_compose.py`](tests/unit/test_production_compose.py)
+asserts them so this contract can't drift silently. The API's container
+port (`8000`) is unchanged from development; only the production host
+side is `8080`, not `8000` — don't confuse the two when reading
+`compose.prod.yml`'s `"127.0.0.1:8080:8000"`.
+
+### Production directory layout
+
+```
+/opt/canumpe/
+├── apps/
+│   └── academic-platform/
+│       ├── compose.prod.yml        # from this repo, copied at deploy time
+│       └── .env                    # API/DB secrets — never in Git
+│
+├── integrations/
+│   └── academic-platform/
+│       └── moodle-sync/
+│           ├── .venv/              # isolated virtualenv (see below)
+│           └── src/                # approved tagged checkout, pip-installed into .venv
+│
+├── config/
+│   └── academic-platform/
+│       └── moodle-sync.env         # chmod 600, owned by academic-sync — never in Git
+│
+└── logs/
+    └── academic-platform/          # reserved; the sync itself logs to stdout/stderr (see below)
+```
+
+No secrets live in this repository at any of these paths — `.env` and
+`moodle-sync.env` are created on the host from `.env.example` /
+`deploy/systemd/moodle-sync.env.example`.
+
+### Virtual environment (Moodle sync only)
+
+Planned location: `/opt/canumpe/integrations/academic-platform/moodle-sync/.venv`.
+
+The sync module is installed into this venv, not run from a source
+checkout in place, and never with `pip install -e`. There is no lock
+file in this project yet, so "reproducible" here means: pin an exact
+approved Git tag/ref, and `pyproject.toml`'s version ranges at that ref
+are what gets installed — a stricter lock (e.g. `pip-compile`/`uv lock`)
+can be added later without changing this deployment shape.
+
+```bash
+# As root or via sudo, once per deployed version:
+python3.12 -m venv /opt/canumpe/integrations/academic-platform/moodle-sync/.venv
+
+git clone --branch v0.3.0 --depth 1 \
+    https://github.com/ulisesvar/canumpe-academic-platform.git \
+    /opt/canumpe/integrations/academic-platform/moodle-sync/src
+
+/opt/canumpe/integrations/academic-platform/moodle-sync/.venv/bin/pip install \
+    --no-cache-dir \
+    /opt/canumpe/integrations/academic-platform/moodle-sync/src
+
+chown -R academic-sync:academic-sync /opt/canumpe/integrations/academic-platform/moodle-sync
+```
+
+No global `pip install` anywhere — everything above installs into the
+dedicated venv. Updating to a new approved version repeats this (new
+tag, fresh `git clone`, `pip install` into the same venv path, or a
+fresh venv if preferred) — the running systemd unit is unaffected until
+its next scheduled/manual run.
+
+### Dedicated system user
+
+Production uses a dedicated Linux account, `academic-sync`:
+
+- no interactive login, no SSH access, not root
+- can read the approved sync code and the protected environment file
+- can execute the sync job
+- writes only where explicitly necessary (nowhere, in practice — the
+  sync only talks to PostgreSQL over the network)
+
+```bash
+useradd --system --no-create-home --shell /usr/sbin/nologin academic-sync
+```
+
+### Database access model
+
+**Moodle source** (`academic_sync_moodle`): created manually in
+production PostgreSQL by Moodle's administrators, `SELECT`-only, never
+by application code. `MOODLE_DB_URL` uses `127.0.0.1` because the sync
+runs on the same host as Moodle:
+
+```
+postgresql+psycopg://academic_sync_moodle:<secret>@127.0.0.1:5432/moodle
+```
+
+**Academic Database**: exposed only on localhost, on a non-conflicting
+port — Moodle already owns 5432 on this host, so the Academic Database
+uses 5434 (`compose.prod.yml` publishes `127.0.0.1:5434:5432`; never
+`0.0.0.0`, never reachable from the LAN or Internet). The sync uses a
+dedicated, least-privilege ingest credential, `academic_ingest_moodle` —
+not the database-owner credential the API/migrate services use, and not
+created by application code (see
+`deploy/sql/academic_ingest_moodle_grants.example.sql` for the exact,
+minimal grants: `raw_moodle`, `staging`, `integration`, and only
+`academic.students`/`academic.courses`/`academic.enrollments` — no
+`CREATE`, no ownership, no superuser, no `DELETE` on `academic`).
+
+```
+postgresql+psycopg://academic_ingest_moodle:<secret>@127.0.0.1:5434/canumpe
+```
+
+The public API continues to reach the Academic Database over the
+internal Docker network (`compose.prod.yml`'s `db` service) — the
+localhost port above exists for host-native integration jobs, not for
+the API. The API's own production host binding is `127.0.0.1:8080`
+(container port `8000`) — see the port convention table above.
+
+### systemd: oneshot service + timer
+
+No cron. Example unit files live in `deploy/systemd/`:
+[`academic-moodle-sync.service`](deploy/systemd/academic-moodle-sync.service),
+[`academic-moodle-sync.timer`](deploy/systemd/academic-moodle-sync.timer),
+and a template for the protected environment file,
+[`moodle-sync.env.example`](deploy/systemd/moodle-sync.env.example).
+
+The service is `Type=oneshot`, runs as `User=academic-sync`, reads
+`EnvironmentFile=/opt/canumpe/config/academic-platform/moodle-sync.env`,
+and executes the venv's `python -m app.integration.moodle.sync` directly
+(no shell). A non-zero exit code — see `main()` in
+`app/integration/moodle/sync.py` — marks the systemd run failed. The
+timer's `OnCalendar=` in the example is illustrative only; actual
+production cadence is an operational decision the repository does not
+fix. `Persistent=true` lets a run missed during a reboot/outage catch up
+automatically instead of silently waiting for the next scheduled time.
+
+Application code never enables, starts, or otherwise touches these
+units — installing and enabling them is a manual operator action (see
+the comments at the top of the `.service` file).
+
+### Logs: journald vs. integration.sync_runs
+
+Two different, complementary views:
+
+- **`journalctl -u academic-moodle-sync.service`** / **`systemctl status
+  academic-moodle-sync.service`** — system-level execution status: did
+  the process run, when, did it exit non-zero, and its stdout/stderr.
+  The sync logs cleanly to stdout/stderr for exactly this — no custom
+  log file handling is needed for core operation.
+- **`integration.sync_runs`** — pipeline-level operational detail: row
+  counters, `status`, `error_message`, `snapshot_time`, per batch. This
+  is unchanged from Phase 2 and lives in the Academic Database regardless
+  of how the job was invoked.
 
 ## Prerequisites
 
@@ -226,7 +530,10 @@ pytest
 docker compose -f compose.test.yml down
 ```
 
-Tests never touch Moodle, Attendance, or any production database/credentials.
+Tests never touch a real Moodle or Attendance instance, or any production
+database/credentials. Moodle-sourced tests run against a minimal fake
+Moodle schema (`tests/integration/moodle/fake_moodle.py`) created in the
+same disposable test database.
 
 ## Run Ruff
 
@@ -279,8 +586,11 @@ completely clean slate.
 
 ## Deferred to later phases
 
-- Moodle integration and Attendance integration (no source connections exist)
-- Extraction and synchronization jobs (schedulers, timers, watermark advancement)
-- `raw_moodle` / `raw_attendance` / `staging` entity tables
+- Attendance integration (no source connection exists)
+- Actually enabling/installing the systemd timer and deciding its
+  production cadence — example units exist (`deploy/systemd/`), but
+  nothing runs them yet and the schedule is an operational decision
+- Incremental Moodle extraction (Phase 2 is full-extraction only)
+- `raw_attendance` / `staging` entity tables for Attendance
 - `auth` tables and API authentication / API keys
 - Academic API endpoints, grades, assignments, attendance, participation

@@ -11,7 +11,9 @@ INTEGRATION_TABLES = {
     "sync_runs",
     "sync_state",
 }
-EMPTY_SCHEMAS = ("raw_moodle", "raw_attendance", "staging", "auth")
+RAW_MOODLE_TABLES = {"students", "courses", "enrollments"}
+STAGING_TABLES = {"students", "courses", "enrollments"}
+EMPTY_SCHEMAS = ("raw_attendance", "auth")
 
 
 def test_upgrade_head_succeeds_from_empty_database(db_engine: Engine) -> None:
@@ -29,8 +31,22 @@ def test_expected_tables_and_constraints_are_present(db_engine: Engine) -> None:
 
     assert set(inspector.get_table_names(schema="academic")) == ACADEMIC_TABLES
     assert set(inspector.get_table_names(schema="integration")) == INTEGRATION_TABLES
+    assert set(inspector.get_table_names(schema="raw_moodle")) == RAW_MOODLE_TABLES
+    assert set(inspector.get_table_names(schema="staging")) == STAGING_TABLES
     for schema in EMPTY_SCHEMAS:
         assert inspector.get_table_names(schema=schema) == []
+
+    raw_moodle_students_unique = {
+        tuple(sorted(uc["column_names"]))
+        for uc in inspector.get_unique_constraints("students", schema="raw_moodle")
+    }
+    assert tuple(sorted(("batch_id", "source_id"))) in raw_moodle_students_unique
+
+    staging_students_unique = {
+        tuple(sorted(uc["column_names"]))
+        for uc in inspector.get_unique_constraints("students", schema="staging")
+    }
+    assert tuple(sorted(("source_system", "source_id"))) in staging_students_unique
 
     student_unique_columns = {
         tuple(sorted(uc["column_names"]))
@@ -61,10 +77,29 @@ def test_downgrade_then_upgrade_is_clean(db_engine: Engine) -> None:
     try:
         command.downgrade(cfg, "0001_baseline")
         assert inspect(db_engine).get_table_names(schema="academic") == []
+        assert inspect(db_engine).get_table_names(schema="raw_moodle") == []
+        assert inspect(db_engine).get_table_names(schema="staging") == []
     finally:
         command.upgrade(cfg, "head")
 
     assert "students" in inspect(db_engine).get_table_names(schema="academic")
+    assert "students" in inspect(db_engine).get_table_names(schema="raw_moodle")
+    assert "students" in inspect(db_engine).get_table_names(schema="staging")
+
+
+def test_downgrade_one_step_from_head_removes_only_moodle_ingestion(db_engine: Engine) -> None:
+    cfg = alembic_config()
+
+    try:
+        command.downgrade(cfg, "0002_academic_data_foundation")
+        assert inspect(db_engine).get_table_names(schema="raw_moodle") == []
+        assert inspect(db_engine).get_table_names(schema="staging") == []
+        # Phase 1 tables are untouched by this migration's downgrade.
+        assert set(inspect(db_engine).get_table_names(schema="academic")) == ACADEMIC_TABLES
+    finally:
+        command.upgrade(cfg, "head")
+
+    assert set(inspect(db_engine).get_table_names(schema="raw_moodle")) == RAW_MOODLE_TABLES
 
 
 def test_upgrade_head_twice_is_safe() -> None:

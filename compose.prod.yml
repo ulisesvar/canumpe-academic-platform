@@ -1,0 +1,63 @@
+# Production compose file for the CANUMPE host.
+#
+# Deployed to /opt/canumpe/apps/academic-platform/compose.prod.yml,
+# alongside a .env file (never committed to this repository — see
+# .env.example for the variables it must define). Pulls prebuilt images
+# from GHCR; never builds locally (the production host has no
+# `docker build`, no git checkout of this repo, no host Python for this
+# application).
+#
+# The Moodle sync does NOT run here. It runs natively on the host via
+# systemd (deploy/systemd/), specifically so it can reach Moodle's
+# PostgreSQL on localhost without exposing it — see the README's
+# "Host-native operational integration jobs" section.
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - canumpe_pg_data:/var/lib/postgresql/data
+    ports:
+      # localhost-only, so the host-native Moodle sync (and any future
+      # host-native integration job) can reach the Academic Database
+      # without exposing it to the LAN/Internet. 5434, not 5432 — Moodle's
+      # own PostgreSQL already owns 5432 on this host.
+      - "127.0.0.1:5434:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    image: ${IMAGE:-ghcr.io/ulisesvar/canumpe-academic-platform}:${IMAGE_TAG:-latest}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    command: ["alembic", "upgrade", "head"]
+
+  api:
+    image: ${IMAGE:-ghcr.io/ulisesvar/canumpe-academic-platform}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # The API never receives MOODLE_DB_URL/MOODLE_COURSE_ID — it stays
+      # source-independent and only ever talks to the Academic Database.
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: production
+    ports:
+      # Established production convention: host 8080 (not 8000 — 8000 is
+      # the container's own port; the host side is deliberately 8080).
+      - "127.0.0.1:8080:8000"
+
+volumes:
+  canumpe_pg_data:

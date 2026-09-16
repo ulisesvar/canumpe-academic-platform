@@ -1,0 +1,49 @@
+# Example unit for the CANUMPE host. Reference material — adapt paths/
+# users to the actual deployment before installing to /etc/systemd/system/.
+#
+# Runs the Moodle sync as a one-shot, host-native job (never in Docker):
+# it needs to reach Moodle's PostgreSQL on localhost without exposing it.
+# See the README's "Host-native operational integration jobs" section.
+#
+# Install (manual, by an operator — never run automatically by app code):
+#   sudo cp academic-moodle-sync.service academic-moodle-sync.timer \
+#       /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now academic-moodle-sync.timer
+#
+# Run once by hand (useful after deploying a new version):
+#   sudo systemctl start academic-moodle-sync.service
+#   journalctl -u academic-moodle-sync.service -e
+
+[Unit]
+Description=CANUMPE Academic Platform - Moodle sync (one-shot)
+Wants=network-online.target
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+User=academic-sync
+Group=academic-sync
+
+# Owned by academic-sync, mode 600. Never committed to Git — see
+# deploy/systemd/moodle-sync.env.example for the variables it must set.
+EnvironmentFile=/opt/canumpe/config/academic-platform/moodle-sync.env
+
+WorkingDirectory=/opt/canumpe/integrations/academic-platform/moodle-sync
+
+# `app` is installed into this venv (not run from a source checkout in
+# place) — see the README's virtualenv deployment steps.
+ExecStart=/opt/canumpe/integrations/academic-platform/moodle-sync/.venv/bin/python -m app.integration.moodle.sync
+
+# A non-zero exit (see app.integration.moodle.sync.main) marks this run
+# failed in systemd/journald, independent of integration.sync_runs.
+
+# Least privilege / hardening. The job only ever talks to PostgreSQL over
+# the network; it needs no writable filesystem paths at all.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
