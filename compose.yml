@@ -44,5 +44,22 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
 
+  moodle-sync:
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-canumpe}:${POSTGRES_PASSWORD:-canumpe}@db:5432/${POSTGRES_DB:-canumpe}
+      MOODLE_DB_URL: ${MOODLE_DB_URL}
+      MOODLE_COURSE_ID: ${MOODLE_COURSE_ID:-2}
+    command: ["python", "-m", "app.integration.moodle.sync"]
+    # Never started by `docker compose up`. Run explicitly and manually:
+    #   docker compose run --rm moodle-sync
+    # Not scheduled — see the README for why.
+    profiles: ["moodle-sync"]
+
 volumes:
   canumpe_pg_data:

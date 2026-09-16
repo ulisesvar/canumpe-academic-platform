@@ -26,15 +26,19 @@ Attendance ───────┘
 - The public Academic API will read only from that curated database, so it
   never depends on Moodle or Attendance being available.
 
-**None of that integration exists yet.** This repository currently
-implements infrastructure and a database foundation only.
+**Attendance integration does not exist yet.** This repository currently
+implements infrastructure, a database foundation, and a Moodle ingestion
+pipeline for students/courses/enrollments only.
 
-## Current phase: Phase 1 — Academic Data Foundation
+## Current phase: Phase 2 — Moodle Ingestion
 
 Phase 0 built the project skeleton and shipped a validated production
-deployment (`GET /health` only). Phase 1 adds the **database foundation**
-for the pipeline above — schemas and canonical tables, no source
-connections and no synchronization logic yet.
+deployment (`GET /health` only). Phase 1 added the database foundation —
+schemas and canonical tables, no source connections yet. Phase 2 adds a
+working Moodle ingestion pipeline (students, courses, enrollments only):
+read-only extraction → `raw_moodle` → `staging` → validation → a
+transactional merge into `academic`. It is invoked manually, as a
+separate command — never scheduled, and never triggered by the API.
 
 ### Data flow (target architecture)
 
@@ -56,19 +60,19 @@ API.
 
 ### PostgreSQL schemas
 
-| Schema | Purpose | Status in Phase 1 |
+| Schema | Purpose | Status in Phase 2 |
 |---|---|---|
-| `raw_moodle` | Landing representation of selected Moodle source entities, as extracted. | Empty — no tables yet |
+| `raw_moodle` | Landing representation of selected Moodle source entities, as extracted — faithful, append-only, never validated. | `students`, `courses`, `enrollments` |
 | `raw_attendance` | Landing representation of selected Attendance source entities, as extracted. | Empty — no tables yet |
-| `staging` | Temporary normalized/validated representation before canonical merge. Not a system of record. | Empty — no tables yet |
+| `staging` | Normalized/validated candidate rows for one batch, rebuilt on every run. Not a system of record. | `students`, `courses`, `enrollments` |
 | `academic` | Curated canonical data. The only schema the Academic API reads from. | `students`, `courses`, `enrollments` |
 | `integration` | Source-identity mappings and pipeline observability (never business data). | `student_sources`, `course_sources`, `enrollment_sources`, `sync_runs`, `sync_state` |
 | `auth` | Reserved for future API authentication. | Empty — no tables yet |
 
-`raw_moodle`, `raw_attendance`, `staging`, and `auth` are created now only
-to establish architectural boundaries. Entity-specific tables in them are
-intentionally **not** invented before the real Moodle/Attendance source
-models are studied in a later phase.
+`raw_attendance` and `auth` remain empty — established now only for
+architectural boundaries. Entity-specific tables for Attendance are
+intentionally **not** invented before its real source model is studied in
+a later phase.
 
 ### Architectural invariants
 
@@ -121,14 +125,125 @@ including the future sync implementation — **must set `updated_at`/
 column must set `updated_at` in the same write, not rely on it happening
 automatically.
 
-### What Phase 1 does not implement yet
+### Moodle ingestion pipeline
 
-- No connection to Moodle or Attendance, and no real student data
-- No extraction or synchronization jobs (no schedulers, no timers)
-- No `raw_*`/`staging` entity tables — only the empty schemas
+```
+Moodle (read-only)
+        ↓  one REPEATABLE READ, READ ONLY transaction
+  extraction              app.integration.moodle.source
+        ↓
+  raw_moodle.*             faithful landing copy, append-only, never validated
+        ↓
+  staging.*                normalized candidates, rebuilt every run
+        ↓
+  validation               batch-wide checks (duplicates, dangling references)
+        ↓  only if zero issues
+  canonical merge           one transaction: academic.* + integration.*_sources
+        ↓
+  integration.sync_runs / sync_state
+```
+
+Implemented in `app/integration/moodle/` (`source.py`, `raw_writer.py`,
+`staging_writer.py`, `validation.py`, `merge.py`, `runs.py`, `sync.py`).
+
+**Source contract.** The account number is a Moodle custom profile field
+(`mdl_user_info_field.shortname = 'cuenta'`, joined to
+`mdl_user_info_data`) — never a hardcoded `fieldid`, and never
+`mdl_user.idnumber`. A student is only extracted if `mdl_user.deleted =
+0`; an enrollment is only extracted if both `mdl_user_enrolments.status =
+0` and `mdl_enrol.status = 0`. Course scope is `MOODLE_COURSE_ID`
+(configuration, not a hardcoded id in SQL). If the same account number
+resolves to more than one non-deleted Moodle user, extraction raises
+immediately (`MoodleSourceIntegrityError`) rather than silently picking
+one.
+
+**Consistent snapshot.** All three extraction queries (students, courses,
+enrollments) run inside one `SET TRANSACTION ISOLATION LEVEL REPEATABLE
+READ READ ONLY` transaction, so they see one coherent view of Moodle even
+if something else commits a change to Moodle mid-extraction. The
+connection is always cleanly committed (read-only, so this just releases
+the snapshot) or rolled back, and closed.
+
+**Full extraction, on purpose.** Phase 2 re-extracts the whole configured
+course scope on every run rather than tracking an incremental
+cursor/watermark. Current data volume is small, so the simplicity is
+worth more than the optimization; `integration.sync_state` already
+records the last successful batch's id/snapshot time so a later phase can
+add incremental extraction without a schema change.
+
+**Idempotency.** Change detection is by `source_hash` (a documented,
+deterministic SHA-256 over business-relevant fields only — never
+`batch_id`/`ingested_at`/`source_updated_at`; see
+`app/integration/moodle/hashing.py`). Re-running the same source state
+produces `rows_inserted=0, rows_updated=0, rows_unchanged=N` — no
+duplicate canonical rows, no duplicate `integration.*_sources` mappings.
+A student enrolled in the same course through more than one Moodle enrol
+method resolves to one canonical enrollment (`academic.enrollments` has
+`UNIQUE(student_id, course_id)`); the merge reuses the existing row
+instead of trying to insert a second one.
+
+**Transaction and failure behavior.** RAW and staging writes commit on
+their own (RAW must survive even if a later stage fails; staging is
+disposable but still worth inspecting after a failed run). Validation
+runs read-only. The canonical merge — `academic.*` writes, the
+`integration.*_sources` mapping updates, and advancing
+`integration.sync_state` — all happen in one transaction; a `sync_runs`
+row only ever reads SUCCESS once that transaction has actually committed.
+Any blocking validation issue, or any exception during the merge, aborts
+before or rolls back the merge entirely: existing academic data is never
+partially updated, and the failed run is recorded with `status=FAILED`
+and an `error_message`. The watermark in `sync_state` is only touched
+inside the merge transaction, so it never advances on a failed run.
+
+**Timestamps.** Per the Phase 1 invariant, the merge always sets
+`updated_at`/`last_seen_at`/`synced_at` explicitly (never relies on ORM
+`onupdate`) — including on the unchanged path, where `last_seen_at`/
+`synced_at` still advance because the source was observed again even
+though nothing about it changed, while `updated_at` on the canonical row
+stays put.
+
+**Missing records.** A student/enrollment absent from one extraction
+(e.g. unenrolled) is not touched — never physically deleted and never
+inferred as inactive. It simply isn't in that batch; a future phase can
+add explicit logic for "expected vs. unexpected disappearance."
+
+**Source identity.** Uses the Phase 1 mapping tables
+(`integration.student_sources`/`course_sources`/`enrollment_sources`) —
+Moodle ids are never canonical primary keys. The stable source identity
+for an enrollment is Moodle's `mdl_user_enrolments.id`.
+
+**Security boundary.** The sync command needs its own read-only Moodle
+credential (production user `academic_sync_moodle`, `SELECT` only) — the
+application never creates that user or grants privileges; that's done by
+Moodle's own administrators outside this codebase. `MOODLE_DB_URL`/
+`MOODLE_COURSE_ID` are only ever read by `app.integration.moodle.config`,
+loaded only by `app.integration.moodle.sync`'s `main()`. The public API
+(`app.core.config.Settings`) has no such fields and never receives these
+variables — see `compose.yml`, where only the `moodle-sync` service gets
+them.
+
+### Run the Moodle sync manually
+
+Never scheduled — no cron, no timer, and the API never triggers it. Run
+it by hand, from a container:
+
+```bash
+cp .env.example .env   # fill in MOODLE_DB_URL / MOODLE_COURSE_ID
+docker compose run --rm moodle-sync
+```
+
+`moodle-sync` is gated behind a Compose profile precisely so `docker
+compose up` never starts it by accident.
+
+### What Phase 2 does not implement yet
+
+- No connection to Attendance, and no real student data anywhere
+- No scheduling of the Moodle sync (no schedulers, no timers, no cron)
+- No incremental extraction (full course-scope re-extraction every run)
+- No `raw_attendance`/`staging` entity tables for Attendance
 - No `auth` tables and no API authentication/API keys
 - No academic API endpoints, grades, assignments, attendance, or participation
-- `GET /health` is unchanged from Phase 0
+- `GET /health` is unchanged from Phase 0; the API still never queries Moodle
 
 ## Developer workstation vs. production host
 
@@ -226,7 +341,10 @@ pytest
 docker compose -f compose.test.yml down
 ```
 
-Tests never touch Moodle, Attendance, or any production database/credentials.
+Tests never touch a real Moodle or Attendance instance, or any production
+database/credentials. Moodle-sourced tests run against a minimal fake
+Moodle schema (`tests/integration/moodle/fake_moodle.py`) created in the
+same disposable test database.
 
 ## Run Ruff
 
@@ -279,8 +397,9 @@ completely clean slate.
 
 ## Deferred to later phases
 
-- Moodle integration and Attendance integration (no source connections exist)
-- Extraction and synchronization jobs (schedulers, timers, watermark advancement)
-- `raw_moodle` / `raw_attendance` / `staging` entity tables
+- Attendance integration (no source connection exists)
+- Scheduling the Moodle sync (schedulers, timers, cron, production automation)
+- Incremental Moodle extraction (Phase 2 is full-extraction only)
+- `raw_attendance` / `staging` entity tables for Attendance
 - `auth` tables and API authentication / API keys
 - Academic API endpoints, grades, assignments, attendance, participation
