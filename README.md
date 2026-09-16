@@ -301,6 +301,25 @@ logic itself (extraction, RAW, staging, validation, merge, idempotency,
 and `integration.sync_runs`/`sync_state` are unchanged from Phase 2's
 implementation).
 
+### Production port convention
+
+All localhost-only, none ever bound to `0.0.0.0`, none reachable from
+the LAN or Internet:
+
+| Service | Host binding |
+|---|---|
+| Moodle PostgreSQL | `127.0.0.1:5432` (pre-existing, unowned by this repo) |
+| Academic PostgreSQL | `127.0.0.1:5434` → container `5432` |
+| Academic API | `127.0.0.1:8080` → container `8000` |
+
+These are the established production values — `compose.prod.yml` is the
+source of truth for the last two, and
+[`tests/unit/test_production_compose.py`](tests/unit/test_production_compose.py)
+asserts them so this contract can't drift silently. The API's container
+port (`8000`) is unchanged from development; only the production host
+side is `8080`, not `8000` — don't confuse the two when reading
+`compose.prod.yml`'s `"127.0.0.1:8080:8000"`.
+
 ### Production directory layout
 
 ```
@@ -404,7 +423,8 @@ postgresql+psycopg://academic_ingest_moodle:<secret>@127.0.0.1:5434/canumpe
 The public API continues to reach the Academic Database over the
 internal Docker network (`compose.prod.yml`'s `db` service) — the
 localhost port above exists for host-native integration jobs, not for
-the API.
+the API. The API's own production host binding is `127.0.0.1:8080`
+(container port `8000`) — see the port convention table above.
 
 ### systemd: oneshot service + timer
 

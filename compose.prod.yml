@@ -55,7 +55,9 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: production
     ports:
-      - "127.0.0.1:8000:8000"
+      # Established production convention: host 8080 (not 8000 — 8000 is
+      # the container's own port; the host side is deliberately 8080).
+      - "127.0.0.1:8080:8000"
 
 volumes:
   canumpe_pg_data:
