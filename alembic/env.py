@@ -7,6 +7,7 @@ from app.academic import models as _academic_models  # noqa: F401  (registers me
 from app.core.config import get_settings
 from app.db.base import Base
 from app.integration import models as _integration_models  # noqa: F401  (registers metadata)
+from app.integration.attendance import models as _attendance_models  # noqa: F401 (metadata)
 from app.integration.moodle import models as _moodle_models  # noqa: F401  (registers metadata)
 
 config = context.config

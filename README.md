@@ -26,19 +26,21 @@ Attendance ───────┘
 - The public Academic API will read only from that curated database, so it
   never depends on Moodle or Attendance being available.
 
-**Attendance integration does not exist yet.** This repository currently
-implements infrastructure, a database foundation, and a Moodle ingestion
-pipeline for students/courses/enrollments only.
+This repository currently implements infrastructure, a database
+foundation, and two ingestion pipelines: Moodle (students, courses,
+enrollments) and Attendance (attendance sessions/records only —
+Attendance never creates students or courses of its own; see below).
 
-## Current phase: Phase 2 — Moodle Ingestion
+## Current phase: Phase 3 — Attendance Ingestion
 
 Phase 0 built the project skeleton and shipped a validated production
-deployment (`GET /health` only). Phase 1 added the database foundation —
-schemas and canonical tables, no source connections yet. Phase 2 adds a
-working Moodle ingestion pipeline (students, courses, enrollments only):
-read-only extraction → `raw_moodle` → `staging` → validation → a
-transactional merge into `academic`. It is invoked manually, as a
-separate command — never scheduled, and never triggered by the API.
+deployment (`GET /health` only). Phase 1 added the database foundation.
+Phase 2 added the Moodle ingestion pipeline, now running in production
+every 30 minutes. Phase 3 adds a working Attendance ingestion pipeline:
+read-only extraction → `raw_attendance` → `staging` → validation/
+reconciliation → a transactional merge into `academic`. Like the Moodle
+sync, it is invoked manually, as a separate command — never scheduled,
+never triggered by the API.
 
 ### Data flow (target architecture)
 
@@ -60,19 +62,19 @@ API.
 
 ### PostgreSQL schemas
 
-| Schema | Purpose | Status in Phase 2 |
+| Schema | Purpose | Status in Phase 3 |
 |---|---|---|
 | `raw_moodle` | Landing representation of selected Moodle source entities, as extracted — faithful, append-only, never validated. | `students`, `courses`, `enrollments` |
-| `raw_attendance` | Landing representation of selected Attendance source entities, as extracted. | Empty — no tables yet |
-| `staging` | Normalized/validated candidate rows for one batch, rebuilt on every run. Not a system of record. | `students`, `courses`, `enrollments` |
-| `academic` | Curated canonical data. The only schema the Academic API reads from. | `students`, `courses`, `enrollments` |
-| `integration` | Source-identity mappings and pipeline observability (never business data). | `student_sources`, `course_sources`, `enrollment_sources`, `sync_runs`, `sync_state` |
+| `raw_attendance` | Landing representation of selected Attendance source entities, as extracted — faithful, append-only, never validated. Never coordinates/distance. | `students`, `sessions`, `attendances` |
+| `staging` | Normalized/validated candidate rows for one batch, rebuilt on every run. Not a system of record. | `students`, `courses`, `enrollments`, `attendance_students`, `attendance_sessions`, `attendance_records` |
+| `academic` | Curated canonical data. The only schema the Academic API reads from. | `students`, `courses`, `enrollments`, `attendance_sessions`, `attendance_records` |
+| `integration` | Source-identity mappings and pipeline observability (never business data). | `student_sources`, `course_sources`, `enrollment_sources`, `attendance_session_sources`, `attendance_record_sources`, `sync_runs`, `sync_state` |
 | `auth` | Reserved for future API authentication. | Empty — no tables yet |
 
-`raw_attendance` and `auth` remain empty — established now only for
-architectural boundaries. Entity-specific tables for Attendance are
-intentionally **not** invented before its real source model is studied in
-a later phase.
+`auth` remains empty — established only for architectural boundaries;
+API authentication is a later phase. Attendance students reconcile into
+the *existing* `integration.student_sources` table (just another
+`source_system`) rather than a new mapping table — see below.
 
 ### Architectural invariants
 
@@ -224,17 +226,118 @@ in a container — see "Host-native operational integration jobs" below
 for the full execution model, and `docker compose run --rm moodle-sync`
 further down for the development/testing-only Docker path.
 
-### What Phase 2 does not implement yet
+### Attendance ingestion pipeline
 
-- No connection to Attendance, and no real student data anywhere
-- No cron — scheduling is `deploy/systemd/academic-moodle-sync.timer`,
-  but it is example material, not installed/enabled anywhere yet, and
-  production cadence is not decided by this repository
-- No incremental extraction (full course-scope re-extraction every run)
-- No `raw_attendance`/`staging` entity tables for Attendance
+```
+Attendance (read-only)
+        ↓  one REPEATABLE READ, READ ONLY transaction
+  extraction              app.integration.attendance.source
+        ↓
+  raw_attendance.*         faithful landing copy — no coordinates, ever
+        ↓
+  staging.attendance_*     normalized candidates, rebuilt every run
+        ↓
+  validation               batch checks + account_number reconciliation
+        ↓                  + course resolution — only if zero issues
+  canonical merge           one transaction: academic.* + integration.*_sources
+        ↓
+  integration.sync_runs / sync_state
+```
+
+Implemented in `app/integration/attendance/` (`source.py`, `raw_writer.py`,
+`staging_writer.py`, `validation.py`, `merge.py`, `runs.py`, `sync.py`),
+mirroring the Moodle pipeline's structure closely.
+
+**Minimal-data principle.** The Attendance source schema also carries
+`telegram_id`, `telegram_username`, and per-attendance `latitude`/
+`longitude`/`distance_meters`. None of that is ever ingested — not into
+`raw_attendance`, not into `staging`, not into `academic`. Only what
+academic attendance actually needs is extracted: student id + account
+number; session id + `opened_at`/`closed_at`/`status`; attendance id +
+student/session ids + `created_at`. `raw_attendance.attendances` has no
+location columns at all — this is enforced at the schema level, not just
+by the extraction query, so a future change can't silently start
+collecting them by accident.
+
+**Attendance creates no canonical students or courses.** The canonical
+student population comes from Moodle. An Attendance student reconciles
+to an *existing* `academic.students` row by `account_number` — this
+pipeline never runs `INSERT INTO academic.students`. If an
+`account_number` doesn't resolve to exactly one academic student
+(zero matches, or — structurally prevented by `academic.students`'
+own `UNIQUE(account_number)`, but checked anyway — more than one), the
+whole batch fails rather than creating a student, skipping it, or
+guessing. The mapping itself reuses the existing
+`integration.student_sources` table with `source_system='attendance'` —
+exactly the "moodle / 137 and attendance / 25 both map to
+`academic.students.id = 8`" example from the Phase 1 design.
+
+**Course association through the Moodle mapping.** The Attendance
+source has no course id of its own. `ATTENDANCE_MOODLE_COURSE_ID`
+(config) is resolved through the *existing* Moodle course mapping —
+`integration.course_sources` where `source_system='moodle'` and
+`source_id` is that configured id — never a hardcoded
+`academic.courses.id`. If that mapping doesn't exist (the Moodle course
+hasn't been synced yet), the batch fails rather than guessing or
+creating a course.
+
+**RAW → staging → validation → merge**, same shape as Moodle: RAW and
+staging commit independently of the merge outcome; validation (batch
+duplicates, dangling `attendance` → `student`/`session` references,
+account_number reconciliation, course resolution) runs read-only and,
+if it finds anything, the whole batch fails before touching `academic`;
+the canonical merge — sessions, records, source mapping updates, the
+`sync_state` watermark — happens in one transaction, and a `sync_runs`
+row only reads SUCCESS once that transaction commits.
+
+**Idempotency.** Change detection is by `source_hash`, exactly like
+Moodle. Re-running identical source state yields
+`rows_inserted=0, rows_updated=0, rows_unchanged=N`. A session's
+`OPEN → CLOSED` transition updates the same canonical
+`academic.attendance_sessions` row (matched via
+`integration.attendance_session_sources`) — never a duplicate. An
+already-present attendance record is never duplicated
+(`UNIQUE(attendance_session_id, student_id)` plus the source mapping's
+own `UNIQUE(source_system, source_id)`).
+
+**Absence is not calculated here.** Ingestion records only source facts:
+a session existed, a student recorded attendance at it. Whether a
+student who has *no* `academic.attendance_records` row for a session was
+absent, and any percentage/summary built from that, is future API/
+business logic — deliberately out of scope for this ingestion layer.
+
+**Failure behavior.** Same as Moodle: a blocking validation issue or any
+merge exception leaves `academic` and the `sync_state` watermark exactly
+as they were, and records the run as `FAILED` with an `error_message`.
+
+**Security boundary and host-native execution.** Same operational
+pattern as the Moodle sync — its own read-only source credential
+(production user `academic_sync_attendance`), a dedicated Academic
+ingest credential (`academic_ingest_attendance`, least-privilege — see
+`deploy/sql/academic_ingest_attendance_grants.example.sql`), and
+`ATTENDANCE_DB_URL`/`ATTENDANCE_MOODLE_COURSE_ID` read only by
+`app.integration.attendance.config`, never by the public API. The
+Attendance PostgreSQL currently runs in the `asistencias-db-1` Docker
+container (database `asistencia`) on the CANUMPE host; the sync reaches
+it over whatever localhost port that container already publishes — no
+public exposure, no Docker-to-Docker networking workaround. See
+`deploy/systemd/academic-attendance-sync.{service,timer}` and
+`deploy/systemd/attendance-sync.env.example` — reference material only,
+not installed or enabled by this repository.
+
+### What Phase 3 does not implement yet
+
+- No academic API endpoints, grades, assignments, attendance
+  percentages, or absence calculations — ingestion records source facts
+  only
+- No cron — scheduling is `deploy/systemd/academic-attendance-sync.timer`,
+  example material, not installed/enabled anywhere, and production
+  cadence is not decided by this repository
+- No incremental extraction (full source re-extraction every run —
+  current volume is tiny: 13 students, 7 sessions, 66 attendances)
 - No `auth` tables and no API authentication/API keys
-- No academic API endpoints, grades, assignments, attendance, or participation
-- `GET /health` is unchanged from Phase 0; the API still never queries Moodle
+- `GET /health` is unchanged from Phase 0; the API still never queries
+  Moodle or Attendance and never receives their credentials
 
 ## Developer workstation vs. production host
 
@@ -274,32 +377,35 @@ CANUMPE distinguishes two kinds of production workload:
 - **Applications** — normally Docker/GHCR, per the model above. The
   Academic API and the Academic Database.
 - **Operational integration jobs** — may run natively on the host when
-  they need direct access to a *local* source system. The Moodle sync,
-  today; a future Attendance sync, potentially.
+  they need direct access to a *local* source system. The Moodle sync
+  (running in production, every 30 minutes) and the Attendance sync
+  (Phase 3 — reference deployment material only, not deployed yet).
 
-**Why the Moodle sync runs on the host, not in Docker.** Moodle's
-PostgreSQL listens on `127.0.0.1` only, by design — it is not reachable
-from anywhere else, including from inside a Docker network, without
-either exposing it publicly or building a Docker-to-host networking
-workaround. Neither is acceptable. Running the sync as a native process
-on the same host as Moodle lets it reach `127.0.0.1:5432` exactly like
-any other local client, with zero change to Moodle's network exposure:
+**Why these syncs run on the host, not in Docker.** Moodle's PostgreSQL
+listens on `127.0.0.1` only, by design; the Attendance PostgreSQL
+currently runs in the `asistencias-db-1` Docker container, published to
+a localhost port on the same host. Neither is reachable from inside a
+different Docker network without either exposing it publicly or
+building a Docker-to-host networking workaround — neither of which is
+acceptable. Running each sync as a native process on the same host as
+its source lets it reach `127.0.0.1:<port>` exactly like any other local
+client, with zero change to the source's network exposure:
 
 ```
-Moodle PostgreSQL (127.0.0.1:5432, read-only)
-        ↓
-   host-native Python sync job (systemd oneshot)
-        ↓
-Academic PostgreSQL (127.0.0.1:5434, dedicated ingest credential)
-        ↓
-   Academic API (Docker, internal network only)
+Moodle PostgreSQL (127.0.0.1:5432)  ──┐
+                                       ├─→ host-native Python sync jobs (systemd oneshot)
+Attendance PostgreSQL (127.0.0.1:<port>, Docker) ──┘
+                                       ↓
+                Academic PostgreSQL (127.0.0.1:5434, dedicated ingest credential per source)
+                                       ↓
+                        Academic API (Docker, internal network only)
 ```
 
 The Academic API and Academic Database stay exactly as Dockerized as
-before — this only changes how the *sync job* runs, not the pipeline
+before — this only changes how the *sync jobs* run, not the pipeline
 logic itself (extraction, RAW, staging, validation, merge, idempotency,
-and `integration.sync_runs`/`sync_state` are unchanged from Phase 2's
-implementation).
+and `integration.sync_runs`/`sync_state` are unchanged from how Phase 2
+established them).
 
 ### Production port convention
 
@@ -331,25 +437,34 @@ side is `8080`, not `8000` — don't confuse the two when reading
 │
 ├── integrations/
 │   └── academic-platform/
-│       └── moodle-sync/
-│           ├── .venv/              # isolated virtualenv (see below)
+│       ├── moodle-sync/
+│       │   ├── .venv/              # isolated virtualenv (see below)
+│       │   └── src/                # approved tagged checkout, pip-installed into .venv
+│       └── attendance-sync/
+│           ├── .venv/              # its own isolated virtualenv
 │           └── src/                # approved tagged checkout, pip-installed into .venv
 │
 ├── config/
 │   └── academic-platform/
-│       └── moodle-sync.env         # chmod 600, owned by academic-sync — never in Git
+│       ├── moodle-sync.env         # chmod 600, owned by academic-sync — never in Git
+│       └── attendance-sync.env     # chmod 600, owned by academic-sync — never in Git
 │
 └── logs/
-    └── academic-platform/          # reserved; the sync itself logs to stdout/stderr (see below)
+    └── academic-platform/          # reserved; the syncs log to stdout/stderr (see below)
 ```
 
-No secrets live in this repository at any of these paths — `.env` and
-`moodle-sync.env` are created on the host from `.env.example` /
-`deploy/systemd/moodle-sync.env.example`.
+No secrets live in this repository at any of these paths — `.env`,
+`moodle-sync.env`, and `attendance-sync.env` are created on the host
+from `.env.example` / `deploy/systemd/moodle-sync.env.example` /
+`deploy/systemd/attendance-sync.env.example`.
 
-### Virtual environment (Moodle sync only)
+### Virtual environments (one per sync)
 
-Planned location: `/opt/canumpe/integrations/academic-platform/moodle-sync/.venv`.
+Each sync gets its own isolated venv — planned locations:
+`/opt/canumpe/integrations/academic-platform/moodle-sync/.venv` and
+`/opt/canumpe/integrations/academic-platform/attendance-sync/.venv`.
+The steps below use the Moodle sync as the example; the Attendance sync
+follows the identical pattern at its own path.
 
 The sync module is installed into this venv, not run from a source
 checkout in place, and never with `pip install -e`. There is no lock
@@ -381,12 +496,13 @@ its next scheduled/manual run.
 
 ### Dedicated system user
 
-Production uses a dedicated Linux account, `academic-sync`:
+Production uses one dedicated Linux account, `academic-sync`, for both
+syncs:
 
 - no interactive login, no SSH access, not root
-- can read the approved sync code and the protected environment file
-- can execute the sync job
-- writes only where explicitly necessary (nowhere, in practice — the
+- can read the approved sync code and each protected environment file
+- can execute the sync jobs
+- writes only where explicitly necessary (nowhere, in practice — each
   sync only talks to PostgreSQL over the network)
 
 ```bash
@@ -420,6 +536,26 @@ minimal grants: `raw_moodle`, `staging`, `integration`, and only
 postgresql+psycopg://academic_ingest_moodle:<secret>@127.0.0.1:5434/canumpe
 ```
 
+**Attendance source** (`academic_sync_attendance`): created manually,
+read-only, on the Attendance PostgreSQL running in the
+`asistencias-db-1` Docker container — never by application code.
+
+```
+postgresql+psycopg://academic_sync_attendance:<secret>@127.0.0.1:<port>/asistencia
+```
+
+The Attendance sync uses its own dedicated, least-privilege ingest
+credential, `academic_ingest_attendance` — see
+`deploy/sql/academic_ingest_attendance_grants.example.sql`. It can
+`SELECT` `academic.students`/`academic.courses` (to reconcile and to
+satisfy foreign keys) but has no write access to them at all — only to
+`academic.attendance_sessions`/`academic.attendance_records`,
+`raw_attendance`, `staging`, and its own `integration.*` rows.
+
+```
+postgresql+psycopg://academic_ingest_attendance:<secret>@127.0.0.1:5434/canumpe
+```
+
 The public API continues to reach the Academic Database over the
 internal Docker network (`compose.prod.yml`'s `db` service) — the
 localhost port above exists for host-native integration jobs, not for
@@ -428,39 +564,45 @@ the API. The API's own production host binding is `127.0.0.1:8080`
 
 ### systemd: oneshot service + timer
 
-No cron. Example unit files live in `deploy/systemd/`:
-[`academic-moodle-sync.service`](deploy/systemd/academic-moodle-sync.service),
-[`academic-moodle-sync.timer`](deploy/systemd/academic-moodle-sync.timer),
-and a template for the protected environment file,
-[`moodle-sync.env.example`](deploy/systemd/moodle-sync.env.example).
+No cron, for either sync. Example unit files live in `deploy/systemd/`:
 
-The service is `Type=oneshot`, runs as `User=academic-sync`, reads
-`EnvironmentFile=/opt/canumpe/config/academic-platform/moodle-sync.env`,
-and executes the venv's `python -m app.integration.moodle.sync` directly
-(no shell). A non-zero exit code — see `main()` in
-`app/integration/moodle/sync.py` — marks the systemd run failed. The
-timer's `OnCalendar=` in the example is illustrative only; actual
-production cadence is an operational decision the repository does not
-fix. `Persistent=true` lets a run missed during a reboot/outage catch up
-automatically instead of silently waiting for the next scheduled time.
+- Moodle: [`academic-moodle-sync.service`](deploy/systemd/academic-moodle-sync.service),
+  [`.timer`](deploy/systemd/academic-moodle-sync.timer),
+  [`moodle-sync.env.example`](deploy/systemd/moodle-sync.env.example)
+- Attendance: [`academic-attendance-sync.service`](deploy/systemd/academic-attendance-sync.service),
+  [`.timer`](deploy/systemd/academic-attendance-sync.timer),
+  [`attendance-sync.env.example`](deploy/systemd/attendance-sync.env.example)
+
+Both services are `Type=oneshot`, run as `User=academic-sync`, read
+their own `EnvironmentFile=`, and execute their venv's
+`python -m app.integration.<moodle|attendance>.sync` directly (no
+shell). A non-zero exit code — see each pipeline's `sync.py:main()` —
+marks the systemd run failed. Each timer's `OnCalendar=` in the example
+is illustrative only (the Moodle example mirrors its current 30-minute
+production cadence; the Attendance example does the same, but neither
+timer is installed/enabled anywhere by this repository, and actual
+cadence is an operational decision). `Persistent=true` lets a missed run
+catch up automatically after a reboot/outage instead of silently waiting
+for the next scheduled time.
 
 Application code never enables, starts, or otherwise touches these
 units — installing and enabling them is a manual operator action (see
-the comments at the top of the `.service` file).
+the comments at the top of each `.service` file).
 
 ### Logs: journald vs. integration.sync_runs
 
 Two different, complementary views:
 
-- **`journalctl -u academic-moodle-sync.service`** / **`systemctl status
-  academic-moodle-sync.service`** — system-level execution status: did
-  the process run, when, did it exit non-zero, and its stdout/stderr.
-  The sync logs cleanly to stdout/stderr for exactly this — no custom
-  log file handling is needed for core operation.
+- **`journalctl -u academic-moodle-sync.service`** (or
+  `academic-attendance-sync.service`) / **`systemctl status <unit>`** —
+  system-level execution status: did the process run, when, did it exit
+  non-zero, and its stdout/stderr. Each sync logs cleanly to
+  stdout/stderr for exactly this — no custom log file handling is
+  needed for core operation.
 - **`integration.sync_runs`** — pipeline-level operational detail: row
-  counters, `status`, `error_message`, `snapshot_time`, per batch. This
-  is unchanged from Phase 2 and lives in the Academic Database regardless
-  of how the job was invoked.
+  counters, `status`, `error_message`, `snapshot_time`, per batch, per
+  `source_system` (`moodle` or `attendance`). Lives in the Academic
+  Database regardless of how the job was invoked.
 
 ## Prerequisites
 
@@ -532,8 +674,10 @@ docker compose -f compose.test.yml down
 
 Tests never touch a real Moodle or Attendance instance, or any production
 database/credentials. Moodle-sourced tests run against a minimal fake
-Moodle schema (`tests/integration/moodle/fake_moodle.py`) created in the
-same disposable test database.
+Moodle schema (`tests/integration/moodle/fake_moodle.py`); Attendance-
+sourced tests run against a minimal fake Attendance schema
+(`tests/integration/attendance/fake_attendance.py`) — both created in
+the same disposable test database.
 
 ## Run Ruff
 
@@ -586,11 +730,14 @@ completely clean slate.
 
 ## Deferred to later phases
 
-- Attendance integration (no source connection exists)
-- Actually enabling/installing the systemd timer and deciding its
+- Actually enabling/installing either systemd timer and deciding
   production cadence — example units exist (`deploy/systemd/`), but
   nothing runs them yet and the schedule is an operational decision
-- Incremental Moodle extraction (Phase 2 is full-extraction only)
-- `raw_attendance` / `staging` entity tables for Attendance
+- Deploying the Attendance sync at all (Moodle's is in production;
+  Attendance's is reference material only at the end of Phase 3)
+- Incremental extraction for either pipeline (both are full-extraction
+  only)
 - `auth` tables and API authentication / API keys
-- Academic API endpoints, grades, assignments, attendance, participation
+- Academic API endpoints, grades, assignments, participation, absence
+  calculations, and attendance percentages — ingestion records source
+  facts only

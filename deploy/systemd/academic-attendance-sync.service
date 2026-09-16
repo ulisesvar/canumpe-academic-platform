@@ -1,0 +1,55 @@
+# Example unit for the CANUMPE host. Reference material — adapt paths/
+# users to the actual deployment before installing to /etc/systemd/system/.
+# NOT enabled or deployed by this repository.
+#
+# Runs the Attendance sync as a one-shot, host-native job, the same
+# operational pattern as the Moodle sync. The Attendance PostgreSQL
+# currently runs in the asistencias-db-1 Docker container (database
+# "asistencia") on this same host — the sync reaches it over whatever
+# localhost port that container already publishes, exactly like any
+# other local client; no public exposure, no Docker-to-Docker networking
+# workaround. See the README's "Host-native operational integration
+# jobs" section.
+#
+# Install (manual, by an operator — never run automatically by app code):
+#   sudo cp academic-attendance-sync.service academic-attendance-sync.timer \
+#       /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now academic-attendance-sync.timer
+#
+# Run once by hand (useful after deploying a new version):
+#   sudo systemctl start academic-attendance-sync.service
+#   journalctl -u academic-attendance-sync.service -e
+
+[Unit]
+Description=CANUMPE Academic Platform - Attendance sync (one-shot)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+User=academic-sync
+Group=academic-sync
+
+# Owned by academic-sync, mode 600. Never committed to Git — see
+# deploy/systemd/attendance-sync.env.example for the variables it must set.
+EnvironmentFile=/opt/canumpe/config/academic-platform/attendance-sync.env
+
+WorkingDirectory=/opt/canumpe/integrations/academic-platform/attendance-sync
+
+# `app` is installed into this venv (not run from a source checkout in
+# place) — see the README's virtualenv deployment steps.
+ExecStart=/opt/canumpe/integrations/academic-platform/attendance-sync/.venv/bin/python -m app.integration.attendance.sync
+
+# A non-zero exit (see app.integration.attendance.sync.main) marks this
+# run failed in systemd/journald, independent of integration.sync_runs.
+
+# Least privilege / hardening. The job only ever talks to PostgreSQL over
+# the network; it needs no writable filesystem paths at all.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
