@@ -1,3 +1,8 @@
+# Local development only. Builds images locally and binds PostgreSQL to
+# the conventional 5432 — fine on a developer workstation, which never
+# also runs Moodle. Production uses compose.prod.yml (pulls prebuilt GHCR
+# images, PostgreSQL on 127.0.0.1:5434) and does not run moodle-sync at
+# all — see the README's "Host-native operational integration jobs".
 services:
   db:
     image: postgres:16
@@ -56,9 +61,12 @@ services:
       MOODLE_DB_URL: ${MOODLE_DB_URL}
       MOODLE_COURSE_ID: ${MOODLE_COURSE_ID:-2}
     command: ["python", "-m", "app.integration.moodle.sync"]
-    # Never started by `docker compose up`. Run explicitly and manually:
+    # Development/testing convenience ONLY — never used in production.
+    # Production runs the sync natively on the CANUMPE host via systemd
+    # (deploy/systemd/) so it can reach Moodle's PostgreSQL on localhost
+    # without exposing it. Never started by `docker compose up`; run
+    # explicitly:
     #   docker compose run --rm moodle-sync
-    # Not scheduled — see the README for why.
     profiles: ["moodle-sync"]
 
 volumes:
