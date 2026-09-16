@@ -1,0 +1,22 @@
+# Example unit — see academic-attendance-sync.service for installation
+# steps. NOT enabled or deployed by this repository.
+#
+# The schedule below is illustrative only. Production cadence is an
+# operational decision (how fresh Attendance data needs to be vs. load
+# on both databases) — not something this repository fixes. Adjust
+# OnCalendar= to whatever the operators actually decide; it does not
+# have to match the Moodle sync's timer.
+
+[Unit]
+Description=Run the CANUMPE Attendance sync periodically
+
+[Timer]
+# Example: every 30 minutes, same as the Moodle sync's current
+# production cadence. Change as needed.
+OnCalendar=*-*-* *:0/30
+# Runs a missed sync as soon as possible after the host was down/rebooted,
+# instead of silently skipping it until the next scheduled time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
