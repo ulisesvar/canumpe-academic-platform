@@ -12,10 +12,11 @@ PHASE1_INTEGRATION_TABLES = {
     "sync_runs",
     "sync_state",
 }
-INTEGRATION_TABLES = PHASE1_INTEGRATION_TABLES | {
+PHASE3_INTEGRATION_TABLES = PHASE1_INTEGRATION_TABLES | {
     "attendance_session_sources",
     "attendance_record_sources",
 }
+INTEGRATION_TABLES = PHASE3_INTEGRATION_TABLES | {"sync_issues"}
 RAW_MOODLE_TABLES = {"students", "courses", "enrollments"}
 RAW_ATTENDANCE_TABLES = {"students", "sessions", "attendances"}
 STAGING_TABLES = {
@@ -111,6 +112,20 @@ def test_expected_tables_and_constraints_are_present(db_engine: Engine) -> None:
     }
     assert "ck_sync_runs_status" in sync_run_checks
 
+    sync_issues_unique_columns = {
+        tuple(sorted(uc["column_names"]))
+        for uc in inspector.get_unique_constraints("sync_issues", schema="integration")
+    }
+    assert (
+        tuple(sorted(("source_system", "issue_type", "source_entity", "source_id")))
+        in sync_issues_unique_columns
+    )
+
+    sync_issues_checks = {
+        ck["name"] for ck in inspector.get_check_constraints("sync_issues", schema="integration")
+    }
+    assert "ck_sync_issues_status" in sync_issues_checks
+
 
 def test_downgrade_then_upgrade_is_clean(db_engine: Engine) -> None:
     cfg = alembic_config()
@@ -129,6 +144,27 @@ def test_downgrade_then_upgrade_is_clean(db_engine: Engine) -> None:
     assert "students" in inspect(db_engine).get_table_names(schema="raw_moodle")
     assert "students" in inspect(db_engine).get_table_names(schema="raw_attendance")
     assert "students" in inspect(db_engine).get_table_names(schema="staging")
+
+
+def test_downgrade_one_step_from_head_removes_only_sync_issues(db_engine: Engine) -> None:
+    cfg = alembic_config()
+
+    try:
+        command.downgrade(cfg, "0004_attendance_ingestion")
+        integration_tables = set(inspect(db_engine).get_table_names(schema="integration"))
+        assert integration_tables == PHASE3_INTEGRATION_TABLES
+        assert "sync_issues" not in integration_tables
+        # Attendance ingestion (0004) and everything before it is untouched.
+        assert set(inspect(db_engine).get_table_names(schema="academic")) == ACADEMIC_TABLES
+        assert (
+            set(inspect(db_engine).get_table_names(schema="raw_attendance"))
+            == RAW_ATTENDANCE_TABLES
+        )
+        assert set(inspect(db_engine).get_table_names(schema="staging")) == STAGING_TABLES
+    finally:
+        command.upgrade(cfg, "head")
+
+    assert "sync_issues" in inspect(db_engine).get_table_names(schema="integration")
 
 
 def test_downgrade_one_step_from_head_removes_only_attendance_ingestion(db_engine: Engine) -> None:

@@ -68,7 +68,7 @@ API.
 | `raw_attendance` | Landing representation of selected Attendance source entities, as extracted — faithful, append-only, never validated. Never coordinates/distance. | `students`, `sessions`, `attendances` |
 | `staging` | Normalized/validated candidate rows for one batch, rebuilt on every run. Not a system of record. | `students`, `courses`, `enrollments`, `attendance_students`, `attendance_sessions`, `attendance_records` |
 | `academic` | Curated canonical data. The only schema the Academic API reads from. | `students`, `courses`, `enrollments`, `attendance_sessions`, `attendance_records` |
-| `integration` | Source-identity mappings and pipeline observability (never business data). | `student_sources`, `course_sources`, `enrollment_sources`, `attendance_session_sources`, `attendance_record_sources`, `sync_runs`, `sync_state` |
+| `integration` | Source-identity mappings and pipeline observability (never business data). | `student_sources`, `course_sources`, `enrollment_sources`, `attendance_session_sources`, `attendance_record_sources`, `sync_runs`, `sync_state`, `sync_issues` |
 | `auth` | Reserved for future API authentication. | Empty — no tables yet |
 
 `auth` remains empty — established only for architectural boundaries;
@@ -306,6 +306,83 @@ attendance history — nothing is permanently lost, just delayed.
 - `rows_inserted`/`rows_updated`/`rows_unchanged` — as in the Moodle
   pipeline, driven by `source_hash` comparison, counted across students,
   sessions, and records together.
+
+**Blocking error vs. operational issue.** The platform now has two
+distinct ways a sync can react to a problem:
+
+- **Blocking error** — the whole batch fails (`sync_runs.status =
+  'FAILED'`), `academic` is left exactly as it was, and nothing is
+  learned from this batch. Reserved for things that indicate the source
+  data or the batch itself can't be trusted: duplicate Attendance
+  `account_number`, ambiguous canonical resolution (>1 academic match),
+  duplicate source identity, a broken session/student reference, a
+  duplicate student/session attendance, or a missing
+  `ATTENDANCE_MOODLE_COURSE_ID` mapping.
+- **Operational issue** — the batch still succeeds
+  (`sync_runs.status = 'SUCCESS'`); the specific inconsistency is
+  recorded as a row in `integration.sync_issues` instead of aborting
+  everything. Currently the only such case is an unresolved Attendance
+  student (0 academic matches) — expected, not a data problem, just
+  "Moodle hasn't caught up yet."
+
+**`integration.sync_issues`** (generic — see `app.integration.issues`;
+not specific to Attendance or any one `source_system`) makes an
+operational issue visible and queryable instead of it disappearing into
+`rows_skipped`. Identity is `UNIQUE(source_system, issue_type,
+source_entity, source_id)`, so reprocessing the same inconsistency every
+30 minutes upserts the same row rather than inserting a new one each
+time: `first_seen_at` is set once, on the initial insert;
+`last_seen_at`/`reference_value`/`message` are refreshed explicitly on
+every subsequent occurrence (never an ORM/Core `onupdate`, no triggers —
+same invariant as everywhere else in this platform). `status` is
+`OPEN`/`RESOLVED` (`CHECK` constraint); once the underlying student
+resolves, `app.integration.attendance.merge` finds the matching `OPEN`
+row and sets `status='RESOLVED'` with an explicit `resolved_at` — the
+row is **never deleted**, so resolved issues remain as permanent
+history.
+
+For the current unresolved-student case:
+`source_system='attendance'`, `issue_type='UNRESOLVED_STUDENT'`,
+`source_entity='student'`, `source_id` = the Attendance student's source
+id, `reference_value` = their `account_number`.
+
+*Transaction behavior*: both `open_issue` and `resolve_issue`
+(`app/integration/issues.py`) take an open `connection` and are only
+ever called from inside the same transaction as the canonical merge
+(`app.integration.attendance.merge`, itself called from within
+`sync.py`'s `with app_engine.begin()` block). An `OPEN` issue row —
+like the canonical writes and the `sync_state` watermark it sits
+alongside — therefore only becomes visible once that transaction
+actually commits; if the merge rolls back for any reason, the issue
+write rolls back with it. There is no separate transaction boundary for
+issue tracking to reason about.
+
+Example query — everything currently open, most recently seen first:
+
+```sql
+SELECT
+    source_system,
+    issue_type,
+    source_id,
+    reference_value,
+    status,
+    first_seen_at,
+    last_seen_at,
+    resolved_at
+FROM integration.sync_issues
+WHERE status = 'OPEN'
+ORDER BY last_seen_at DESC;
+```
+
+Look up whether a specific student has ever had an issue, by account
+number:
+
+```sql
+SELECT *
+FROM integration.sync_issues
+WHERE issue_type = 'UNRESOLVED_STUDENT'
+  AND reference_value = '321167907';
+```
 
 **Course association through the Moodle mapping.** The Attendance
 source has no course id of its own. `ATTENDANCE_MOODLE_COURSE_ID`

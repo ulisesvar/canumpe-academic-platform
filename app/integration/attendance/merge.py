@@ -27,7 +27,13 @@ from app.integration.attendance.models.staging import (
 )
 from app.integration.attendance.staging_writer import SOURCE_SYSTEM
 from app.integration.attendance.validation import resolve_moodle_course_id
+from app.integration.issues import open_issue, resolve_issue
 from app.integration.models import AttendanceRecordSource, AttendanceSessionSource, StudentSource
+
+#: integration.sync_issues identity for an Attendance student whose
+#: account_number doesn't resolve to any academic student yet.
+UNRESOLVED_STUDENT_ISSUE_TYPE = "UNRESOLVED_STUDENT"
+STUDENT_SOURCE_ENTITY = "student"
 
 
 @dataclass
@@ -63,6 +69,12 @@ def _reconcile_students(
     academic.students, this mapping — and, via _merge_records, their
     entire attendance history — is created automatically with no data
     ever lost in between.
+
+    A skip is not just a counter: an OPEN integration.sync_issues row
+    (issue_type="UNRESOLVED_STUDENT") is upserted so the inconsistency
+    stays visible and queryable rather than disappearing into
+    rows_skipped. The first time a student resolves, any matching OPEN
+    issue is marked RESOLVED (and retained — never deleted).
     """
     academic_id_by_source_id: dict[str, int] = {}
 
@@ -87,6 +99,20 @@ def _reconcile_students(
 
             if academic_student_id is None:
                 counters.rows_skipped += 1
+                open_issue(
+                    connection,
+                    source_system=SOURCE_SYSTEM,
+                    issue_type=UNRESOLVED_STUDENT_ISSUE_TYPE,
+                    source_entity=STUDENT_SOURCE_ENTITY,
+                    source_id=row.source_id,
+                    reference_value=row.account_number,
+                    message=(
+                        f"attendance account_number {row.account_number!r} "
+                        f"(source_id={row.source_id!r}) does not resolve to any "
+                        "academic student yet"
+                    ),
+                    now=now,
+                )
                 continue
 
             connection.execute(
@@ -98,6 +124,14 @@ def _reconcile_students(
                     last_seen_at=now,
                     synced_at=now,
                 )
+            )
+            resolve_issue(
+                connection,
+                source_system=SOURCE_SYSTEM,
+                issue_type=UNRESOLVED_STUDENT_ISSUE_TYPE,
+                source_entity=STUDENT_SOURCE_ENTITY,
+                source_id=row.source_id,
+                now=now,
             )
             counters.rows_inserted += 1
             academic_id_by_source_id[row.source_id] = academic_student_id

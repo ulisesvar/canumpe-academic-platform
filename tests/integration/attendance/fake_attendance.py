@@ -45,6 +45,7 @@ PIPELINE_TABLES = (
     "integration.course_sources",
     "integration.sync_runs",
     "integration.sync_state",
+    "integration.sync_issues",
     "academic.attendance_records",
     "academic.attendance_sessions",
     "academic.students",
