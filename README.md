@@ -28,19 +28,25 @@ Attendance ───────┘
 
 This repository currently implements infrastructure, a database
 foundation, and two ingestion pipelines: Moodle (students, courses,
-enrollments) and Attendance (attendance sessions/records only —
-Attendance never creates students or courses of its own; see below).
+enrollments, and — since Phase 4 — grade items/student grades) and
+Attendance (attendance sessions/records only — Attendance never creates
+students or courses of its own; see below).
 
-## Current phase: Phase 3 — Attendance Ingestion
+## Current phase: Phase 4 — Moodle Grades Ingestion
 
 Phase 0 built the project skeleton and shipped a validated production
 deployment (`GET /health` only). Phase 1 added the database foundation.
 Phase 2 added the Moodle ingestion pipeline, now running in production
-every 30 minutes. Phase 3 adds a working Attendance ingestion pipeline:
+every 30 minutes. Phase 3 added a working Attendance ingestion pipeline:
 read-only extraction → `raw_attendance` → `staging` → validation/
-reconciliation → a transactional merge into `academic`. Like the Moodle
-sync, it is invoked manually, as a separate command — never scheduled,
-never triggered by the API.
+reconciliation → a transactional merge into `academic`. Phase 4 adds
+grade ingestion — grade items and student grades — as part of the same
+Moodle sync process: read-only extraction → `raw_moodle` → `staging` →
+validation/reconciliation → a transactional merge into `academic`, only
+for real, module-backed activities (never the course total or any
+category aggregate). Like the rest of the platform, it is invoked
+manually, as part of the same one-shot command — never scheduled, never
+triggered by the API.
 
 ### Data flow (target architecture)
 
@@ -62,19 +68,22 @@ API.
 
 ### PostgreSQL schemas
 
-| Schema | Purpose | Status in Phase 3 |
+| Schema | Purpose | Status in Phase 4 |
 |---|---|---|
-| `raw_moodle` | Landing representation of selected Moodle source entities, as extracted — faithful, append-only, never validated. | `students`, `courses`, `enrollments` |
+| `raw_moodle` | Landing representation of selected Moodle source entities, as extracted — faithful, append-only, never validated. | `students`, `courses`, `enrollments`, `grade_items`, `student_grades` |
 | `raw_attendance` | Landing representation of selected Attendance source entities, as extracted — faithful, append-only, never validated. Never coordinates/distance. | `students`, `sessions`, `attendances` |
-| `staging` | Normalized/validated candidate rows for one batch, rebuilt on every run. Not a system of record. | `students`, `courses`, `enrollments`, `attendance_students`, `attendance_sessions`, `attendance_records` |
-| `academic` | Curated canonical data. The only schema the Academic API reads from. | `students`, `courses`, `enrollments`, `attendance_sessions`, `attendance_records` |
-| `integration` | Source-identity mappings and pipeline observability (never business data). | `student_sources`, `course_sources`, `enrollment_sources`, `attendance_session_sources`, `attendance_record_sources`, `sync_runs`, `sync_state`, `sync_issues` |
+| `staging` | Normalized/validated candidate rows for one batch, rebuilt on every run. Not a system of record. | `students`, `courses`, `enrollments`, `attendance_students`, `attendance_sessions`, `attendance_records`, `grade_items`, `student_grades` |
+| `academic` | Curated canonical data. The only schema the Academic API reads from. | `students`, `courses`, `enrollments`, `attendance_sessions`, `attendance_records`, `grade_items`, `student_grades` |
+| `integration` | Source-identity mappings and pipeline observability (never business data). | `student_sources`, `course_sources`, `enrollment_sources`, `attendance_session_sources`, `attendance_record_sources`, `grade_item_sources`, `student_grade_sources`, `sync_runs`, `sync_state`, `sync_issues` |
 | `auth` | Reserved for future API authentication. | Empty — no tables yet |
 
 `auth` remains empty — established only for architectural boundaries;
 API authentication is a later phase. Attendance students reconcile into
 the *existing* `integration.student_sources` table (just another
-`source_system`) rather than a new mapping table — see below.
+`source_system`) rather than a new mapping table; Moodle grades resolve
+students and courses through the *existing* `student_sources`/
+`course_sources` mappings too, creating neither a new student mapping
+table nor any canonical students of their own — see below.
 
 ### Architectural invariants
 
@@ -454,19 +463,201 @@ public exposure, no Docker-to-Docker networking workaround. See
 `deploy/systemd/attendance-sync.env.example` — reference material only,
 not installed or enabled by this repository.
 
-### What Phase 3 does not implement yet
+### Moodle grades ingestion pipeline
 
-- No academic API endpoints, grades, assignments, attendance
-  percentages, or absence calculations — ingestion records source facts
-  only
-- No cron — scheduling is `deploy/systemd/academic-attendance-sync.timer`,
-  example material, not installed/enabled anywhere, and production
-  cadence is not decided by this repository
+```
+Moodle (read-only, same credential as students/courses/enrollments)
+        ↓  one REPEATABLE READ, READ ONLY transaction (its own snapshot)
+  extraction              app.integration.moodle.grades_source
+        ↓
+  raw_moodle.grade_items / student_grades   faithful landing copy, hidden included
+        ↓
+  staging.grade_items / student_grades      normalized candidates, hidden excluded
+        ↓
+  validation               batch checks + course resolution — only if zero issues
+        ↓
+  canonical merge           one transaction: academic.* + integration.*_sources
+        ↓
+  integration.sync_runs / sync_state
+```
+
+Implemented in `app/integration/moodle/` alongside the primary pipeline:
+`grades_source.py`, `grades_hashing.py`, `grades_raw_writer.py`,
+`grades_staging_writer.py`, `grades_validation.py`, `grades_merge.py`,
+`grades_runs.py`, `grades_sync.py` — same shape as the rest of the
+platform, kept in separate `grades_*` modules (rather than folded into
+the existing `source.py`/`merge.py`/etc.) because grades get their own
+`integration.sync_runs` row/entity_type (`grade_items_student_grades`,
+distinct from `students_courses_enrollments`) and depend on — rather
+than create — the mappings the primary sync maintains.
+
+**Grade-item filter: only real activities.** Moodle's gradebook has one
+`mdl_grade_items` row per course for the course total
+(`itemtype='course'`, `itemname` `NULL`/empty) plus one row per category
+aggregate, in addition to one row per actual gradable activity
+(`itemtype='mod'`, e.g. `itemmodule='assign'` with a real `itemname`).
+Only `itemtype='mod'` rows are ever selected — the extraction query's
+`WHERE itemtype = 'mod'` clause excludes the course total and any
+category totals before they ever reach `raw_moodle`, not by later
+filtering. Grades are joined back through `mdl_grade_items` scoped the
+same way, so a grade can never be extracted for an item outside the
+configured course or outside `itemtype='mod'` either.
+
+**`finalgrade` is the canonical grade — never `rawgrade`.** Moodle
+computes `finalgrade` from `rawgrade` after any adjustments/overrides;
+it is the value a student would actually see, and the only one this
+platform ingests. `finalgrade IS NULL` means "not graded yet"; `0` means
+"graded, with a real score of zero." These are never conflated: `grade`
+in `academic.student_grades` is nullable specifically so `NULL` can flow
+through untouched end-to-end (extraction → RAW → staging → canonical),
+and `app.integration.moodle.grades_hashing.student_grade_hash` treats
+`None` and `0` as distinct content, so a transition between them is
+never silently absorbed as "unchanged." Proven directly in
+`tests/integration/moodle/test_grades_merge.py` and
+`tests/unit/test_moodle_grades_hashing.py`.
+
+**Minimal-data principle.** Only what "activity name, grade received,
+maximum grade" actually needs is ingested:
+`mdl_grade_items.id`/`itemname`/`itemmodule`/`grademax`/`hidden`/
+`timemodified`, and `mdl_grade_grades.id`/`itemid`/`userid`/
+`finalgrade`/`hidden`/`timemodified`. Never `rawgrade`/`rawgrademin`/
+`rawgrademax`, `feedback`/`information`, `overridden`/`excluded`,
+aggregation weights or category calculations, grade history, letters,
+outcomes, or scales — none of that is needed for the current product and
+none of it is ever ingested, at any pipeline stage. `itemmodule` is kept
+only as `academic.grade_items.activity_type`, for traceability — the
+Moodle gradebook itself is never modeled beyond that.
+
+**Hidden data: excluded from canonical, not just flagged.** A hidden
+grade item, or an individual hidden grade, must never reach
+`academic` without an explicit product decision to expose it — Phase 4
+has no API yet, so the simpler and safer choice is exclusion, not a
+`hidden` column threaded through staging/canonical that a future change
+could accidentally start reading. `hidden` is preserved faithfully in
+`raw_moodle` (a complete, faithful record of what extraction observed),
+but `app.integration.moodle.grades_staging_writer.write_staging_grades_batch`
+never stages a hidden grade item, and never stages a grade that is
+itself hidden *or* whose parent item is hidden — Moodle's own semantics
+make a hidden item hide every grade under it regardless of any per-grade
+override, so both conditions are checked. Exclusion for being hidden is
+silent (no `issues` entry, no blocking failure, no `sync_issues` row) —
+it is a deliberate design choice, not a data-quality problem. Tested in
+`tests/integration/moodle/test_grades_staging_quality.py`.
+
+**Student resolution: through the existing Moodle mapping, never a new
+one.** A grade's `userid` is the same Moodle user id the primary sync
+already maps via `integration.student_sources`
+(`source_system='moodle'`). Grades resolution is a read-only lookup
+against that *existing* mapping — `app.integration.moodle.grades_merge`
+creates zero new `student_sources` rows and zero new canonical students;
+if `userid` doesn't resolve, this is deliberately **not** a blocking
+error, following the same operationally-safe pattern
+`app.integration.attendance.merge` established for unresolved Attendance
+students: the specific grade is skipped (`rows_skipped` counts it) and
+an `integration.sync_issues` row is opened/refreshed
+(`source_system='moodle'`, `issue_type='UNRESOLVED_GRADE_STUDENT'`,
+`source_entity='student_grade'`, `source_id` = the Moodle grade row id,
+`reference_value` = the Moodle user id) instead of failing the whole
+batch — see `app.integration.issues` and
+`tests/integration/moodle/test_grades_issues.py` for the full
+open/resolve lifecycle. Because Phase 4 always does a full extraction,
+the very next sync re-attempts resolution from scratch: once the primary
+sync creates that student's mapping, the grade imports automatically,
+nothing lost. Unlike Attendance's `account_number` reconciliation, a
+grade's `userid` can never resolve to *more than one* academic student —
+`integration.student_sources` has `UNIQUE(source_system, source_id)` —
+so there is no ambiguous case to guard against.
+
+**Course resolution: through the existing Moodle mapping, never
+hardcoded, and blocking if missing.** Same pattern as Attendance:
+`MOODLE_COURSE_ID` is resolved through `integration.course_sources`
+(`source_system='moodle'`) by
+`app.integration.moodle.grades_validation.resolve_moodle_course_id` —
+never a hardcoded `academic.courses.id`. Unlike an unresolved student,
+a missing course mapping **fails the whole batch**: without it, a grade
+item has nowhere to point in `academic.grade_items.course_id`, which is
+`NOT NULL`. In production this mapping is never actually missing by the
+time grades run — the primary students/courses/enrollments sync (which
+creates it) always runs first, in the same process invocation.
+
+**Full extraction, on purpose.** Same rationale as Phase 2/3: current
+grade volume is tiny, so Phase 4 re-extracts the whole configured
+course's grade items/grades on every run rather than tracking an
+incremental cursor. `integration.sync_state`
+(`entity_type='grade_items_student_grades'`) still records the last
+successful batch's id/snapshot time for a later phase to build on.
+
+**Consistent snapshot.** Both extraction queries (grade items, grades)
+run inside their own `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ
+READ ONLY` transaction — same isolation strategy as Phase 2/3 — so grade
+items and the grades that reference them represent one coherent
+snapshot of Moodle's gradebook, independent of (and not sharing a
+transaction with) the primary sync's own snapshot.
+
+**Idempotency.** Change detection is by `source_hash`, same deterministic
+SHA-256-over-business-fields approach as everywhere else in this
+platform (`app/integration/moodle/grades_hashing.py`) — never
+`batch_id`/`ingested_at`/`source_updated_at`. Re-running identical
+source state yields `rows_inserted=0, rows_updated=0, rows_unchanged=N`.
+A grade change (e.g. `30 → 80`) updates the same canonical
+`academic.student_grades` row (matched via
+`integration.student_grade_sources`) — never a duplicate row; a grade
+item's name change updates the same canonical `academic.grade_items`
+row the same way.
+
+**Grades integrated into the existing Moodle sync — no second
+scheduler.** `app.integration.moodle.sync.main()` (the same
+`academic-moodle-sync.service` one-shot systemd unit, and the same
+`python -m app.integration.moodle.sync` command) runs the primary
+students/courses/enrollments sync, then `run_moodle_grades_sync`, in one
+process invocation — exactly the operational model this phase called
+for: one coherent Moodle sync execution, not a second timer/service.
+Grades run even if the primary sync failed (they resolve through
+whatever mappings already exist from the last successful run, and
+withholding otherwise-mergeable grade data on a transient primary
+failure has no benefit); each stage gets its own `integration.sync_runs`
+row and is independently observable, and the process exits non-zero if
+either stage failed. See `deploy/systemd/academic-moodle-sync.service`
+and `deploy/systemd/moodle-sync.env.example` — unchanged, since grades
+need no new environment variables or credentials.
+
+**Failure behavior.** Same as the rest of the platform: a blocking
+validation issue (missing course mapping, missing grade-item name,
+invalid `max_grade`, an unknown `grade_item_source_id` reference, a
+duplicate grade for the same item+student, or a duplicate source
+identity) or any merge exception leaves `academic` and the `sync_state`
+watermark exactly as they were, and records the run as `FAILED` with an
+`error_message`.
+
+**Security boundary.** No new credentials or environment variables:
+grades are extracted with the same `academic_sync_moodle` (now also
+granted `SELECT` on `mdl_grade_items`/`mdl_grade_grades`) and merged
+with the same `academic_ingest_moodle` (now also granted on
+`academic.grade_items`/`academic.student_grades` — see
+`deploy/sql/academic_ingest_moodle_grants.example.sql`) as the primary
+sync. The public API never receives Moodle credentials and, per Phase 4,
+still exposes no grade data at all — see below.
+
+### What Phase 4 does not implement yet
+
+- No academic API endpoints for grades (or anything else) — ingestion
+  records source facts only; Phase 5 builds the read API after both
+  Attendance and Grades are available
+- No weighted categories, course-total/aggregate grades, or the complete
+  Moodle gradebook — only real `itemtype='mod'` activities, exactly
+  "activity name, grade received, maximum grade"
+- No historical grade tracking — a grade change updates the existing
+  canonical row in place; there is no audit trail of prior values yet
+- No CACEI evidence generation or any other downstream reporting
+- No cron — scheduling is `deploy/systemd/academic-attendance-sync.timer`
+  and `academic-moodle-sync.timer`, example material; production cadence
+  is not decided by this repository
 - No incremental extraction (full source re-extraction every run —
-  current volume is tiny: 13 students, 7 sessions, 66 attendances)
+  current volume is tiny)
 - No `auth` tables and no API authentication/API keys
 - `GET /health` is unchanged from Phase 0; the API still never queries
-  Moodle or Attendance and never receives their credentials
+  Moodle or Attendance and never receives their credentials, and still
+  never exposes any grade, attendance, or academic data
 
 ## Developer workstation vs. production host
 
@@ -642,8 +833,13 @@ useradd --system --no-create-home --shell /usr/sbin/nologin academic-sync
 
 **Moodle source** (`academic_sync_moodle`): created manually in
 production PostgreSQL by Moodle's administrators, `SELECT`-only, never
-by application code. `MOODLE_DB_URL` uses `127.0.0.1` because the sync
-runs on the same host as Moodle:
+by application code. Since Phase 4 this account also has `SELECT` on
+`mdl_grade_items`/`mdl_grade_grades` (grades are extracted by the same
+credential, in the same sync process, as students/courses/enrollments —
+there is no separate reference SQL file for this Moodle-side account to
+update, since it is managed entirely by Moodle's own administrators,
+unlike `academic_ingest_moodle` below). `MOODLE_DB_URL` uses `127.0.0.1`
+because the sync runs on the same host as Moodle:
 
 ```
 postgresql+psycopg://academic_sync_moodle:<secret>@127.0.0.1:5432/moodle
@@ -658,8 +854,10 @@ not the database-owner credential the API/migrate services use, and not
 created by application code (see
 `deploy/sql/academic_ingest_moodle_grants.example.sql` for the exact,
 minimal grants: `raw_moodle`, `staging`, `integration`, and only
-`academic.students`/`academic.courses`/`academic.enrollments` — no
-`CREATE`, no ownership, no superuser, no `DELETE` on `academic`).
+`academic.students`/`academic.courses`/`academic.enrollments`/
+`academic.grade_items`/`academic.student_grades` — no `CREATE`, no
+ownership, no superuser, no `DELETE` on `academic`). The same credential
+merges grades since Phase 4 — no second role, no second grants file.
 
 ```
 postgresql+psycopg://academic_ingest_moodle:<secret>@127.0.0.1:5434/canumpe
@@ -862,11 +1060,14 @@ completely clean slate.
 - Actually enabling/installing either systemd timer and deciding
   production cadence — example units exist (`deploy/systemd/`), but
   nothing runs them yet and the schedule is an operational decision
-- Deploying the Attendance sync at all (Moodle's is in production;
-  Attendance's is reference material only at the end of Phase 3)
-- Incremental extraction for either pipeline (both are full-extraction
-  only)
+- Deploying the Attendance sync at all (Moodle's — students/courses/
+  enrollments and, since Phase 4, grades — is in production; Attendance's
+  is reference material only)
+- Incremental extraction for any pipeline (all are full-extraction only)
 - `auth` tables and API authentication / API keys
-- Academic API endpoints, grades, assignments, participation, absence
-  calculations, and attendance percentages — ingestion records source
-  facts only
+- Academic API endpoints for any data — grades, attendance, assignments,
+  participation, absence calculations, attendance percentages — ingestion
+  records source facts only; Phase 5 builds the read API
+- Weighted grade categories, the course total/aggregate grades, or any
+  other part of Moodle's full gradebook beyond real module activities
+- Historical grade tracking and CACEI evidence generation

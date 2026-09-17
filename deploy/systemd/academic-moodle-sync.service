@@ -3,7 +3,11 @@
 #
 # Runs the Moodle sync as a one-shot, host-native job (never in Docker):
 # it needs to reach Moodle's PostgreSQL on localhost without exposing it.
-# See the README's "Host-native operational integration jobs" section.
+# Since Phase 4, one run of this unit syncs students/courses/enrollments
+# AND grade items/student grades — one coherent Moodle sync process, not
+# a second timer/service for grades. See the README's "Host-native
+# operational integration jobs" and "Moodle grades ingestion pipeline"
+# sections.
 #
 # Install (manual, by an operator — never run automatically by app code):
 #   sudo cp academic-moodle-sync.service academic-moodle-sync.timer \

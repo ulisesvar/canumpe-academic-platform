@@ -48,6 +48,24 @@ CREATE TABLE IF NOT EXISTS mdl_user_enrolments (
     status SMALLINT NOT NULL DEFAULT 0,
     timemodified BIGINT NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS mdl_grade_items (
+    id SERIAL PRIMARY KEY,
+    courseid INTEGER NOT NULL,
+    itemtype TEXT NOT NULL,
+    itemmodule TEXT,
+    itemname TEXT,
+    grademax NUMERIC(10, 5) NOT NULL DEFAULT 100,
+    hidden SMALLINT NOT NULL DEFAULT 0,
+    timemodified BIGINT NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS mdl_grade_grades (
+    id SERIAL PRIMARY KEY,
+    itemid INTEGER NOT NULL,
+    userid INTEGER NOT NULL,
+    finalgrade NUMERIC(10, 5),
+    hidden SMALLINT NOT NULL DEFAULT 0,
+    timemodified BIGINT NOT NULL DEFAULT 0
+);
 """
 
 FAKE_MOODLE_TABLES = (
@@ -57,23 +75,34 @@ FAKE_MOODLE_TABLES = (
     "mdl_course",
     "mdl_enrol",
     "mdl_user_enrolments",
+    "mdl_grade_items",
+    "mdl_grade_grades",
 )
 
 PIPELINE_TABLES = (
     "integration.enrollment_sources",
     "integration.course_sources",
     "integration.student_sources",
+    "integration.student_grade_sources",
+    "integration.grade_item_sources",
     "integration.sync_runs",
     "integration.sync_state",
+    "integration.sync_issues",
+    "academic.student_grades",
+    "academic.grade_items",
     "academic.enrollments",
     "academic.courses",
     "academic.students",
     "raw_moodle.enrollments",
     "raw_moodle.courses",
     "raw_moodle.students",
+    "raw_moodle.student_grades",
+    "raw_moodle.grade_items",
     "staging.enrollments",
     "staging.courses",
     "staging.students",
+    "staging.student_grades",
+    "staging.grade_items",
 )
 
 
@@ -203,6 +232,77 @@ def update_course_fullname(connection: Connection, courseid: int, fullname: str)
     connection.execute(
         text("UPDATE mdl_course SET fullname = :fullname WHERE id = :id"),
         {"fullname": fullname, "id": courseid},
+    )
+
+
+def insert_grade_item(
+    connection: Connection,
+    *,
+    courseid: int,
+    itemtype: str = "mod",
+    itemmodule: str | None = "assign",
+    itemname: str | None = "Tarea 01",
+    grademax: float = 100,
+    hidden: int = 0,
+    timemodified: int = 0,
+) -> int:
+    return connection.execute(
+        text("""
+            INSERT INTO mdl_grade_items
+                (courseid, itemtype, itemmodule, itemname, grademax, hidden, timemodified)
+            VALUES (:courseid, :itemtype, :itemmodule, :itemname, :grademax, :hidden, :timemodified)
+            RETURNING id
+        """),
+        {
+            "courseid": courseid,
+            "itemtype": itemtype,
+            "itemmodule": itemmodule,
+            "itemname": itemname,
+            "grademax": grademax,
+            "hidden": hidden,
+            "timemodified": timemodified,
+        },
+    ).scalar_one()
+
+
+def insert_grade_grade(
+    connection: Connection,
+    *,
+    itemid: int,
+    userid: int,
+    finalgrade: float | None,
+    hidden: int = 0,
+    timemodified: int = 0,
+) -> int:
+    return connection.execute(
+        text("""
+            INSERT INTO mdl_grade_grades (itemid, userid, finalgrade, hidden, timemodified)
+            VALUES (:itemid, :userid, :finalgrade, :hidden, :timemodified)
+            RETURNING id
+        """),
+        {
+            "itemid": itemid,
+            "userid": userid,
+            "finalgrade": finalgrade,
+            "hidden": hidden,
+            "timemodified": timemodified,
+        },
+    ).scalar_one()
+
+
+def update_grade_item_name(connection: Connection, itemid: int, itemname: str) -> None:
+    connection.execute(
+        text("UPDATE mdl_grade_items SET itemname = :itemname WHERE id = :id"),
+        {"itemname": itemname, "id": itemid},
+    )
+
+
+def update_grade_grade_finalgrade(
+    connection: Connection, gradeid: int, finalgrade: float | None
+) -> None:
+    connection.execute(
+        text("UPDATE mdl_grade_grades SET finalgrade = :finalgrade WHERE id = :id"),
+        {"finalgrade": finalgrade, "id": gradeid},
     )
 
 
