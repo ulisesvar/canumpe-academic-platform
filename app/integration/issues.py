@@ -46,9 +46,18 @@ def open_issue(
     source_entity, source_id). Reprocessing the same inconsistency every
     run (e.g. every 30 minutes) must not create a new row each time:
     first_seen_at is preserved by only ever being set on the initial
-    INSERT; last_seen_at/reference_value/message are refreshed on every
-    call via ON CONFLICT DO UPDATE. status/resolved_at are never touched
-    here — only resolve_issue changes those.
+    INSERT (never touched on conflict); last_seen_at/reference_value/
+    message are refreshed on every call via ON CONFLICT DO UPDATE.
+
+    Full lifecycle on the same row: OPEN -> OPEN (repeat calls while
+    still unresolved, a no-op besides refreshing last_seen_at) ->
+    RESOLVED (via resolve_issue) -> OPEN again, if the same
+    inconsistency reappears (a "reopen": this call unconditionally sets
+    status back to OPEN and clears resolved_at on conflict, regardless
+    of the row's current status) -> RESOLVED again, and so on
+    indefinitely. The row's identity and id never change; nothing is
+    ever deleted, so the full history of opens/resolves for one issue is
+    reconstructable from first_seen_at/last_seen_at/resolved_at alone.
     """
     stmt = pg_insert(SyncIssue).values(
         source_system=source_system,
@@ -71,6 +80,8 @@ def open_issue(
         set_={
             "reference_value": stmt.excluded.reference_value,
             "message": stmt.excluded.message,
+            "status": OPEN,
+            "resolved_at": None,
             "last_seen_at": stmt.excluded.last_seen_at,
         },
     )

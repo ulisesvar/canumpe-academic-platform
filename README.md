@@ -341,6 +341,23 @@ row and sets `status='RESOLVED'` with an explicit `resolved_at` — the
 row is **never deleted**, so resolved issues remain as permanent
 history.
 
+**Reopen semantics.** The same row supports the full cycle indefinitely:
+`OPEN → OPEN` (repeat occurrences while still unresolved: a no-op beyond
+refreshing `last_seen_at`) → `RESOLVED` (`resolve_issue`) → `OPEN` again,
+*if the identical inconsistency recurs* → `RESOLVED` again, and so on.
+`open_issue`'s `ON CONFLICT DO UPDATE` unconditionally sets
+`status='OPEN'` and `resolved_at=NULL` on every call, regardless of the
+row's current status — so a previously `RESOLVED` row that reappears is
+correctly reopened rather than incorrectly left `RESOLVED`.
+`first_seen_at` and the row's `id` never change across any of this;
+`reference_value`/`message` are refreshed each time. No new row is ever
+inserted for an identity that already exists, in either direction. (The
+current Attendance pipeline can't actually trigger a reopen — once a
+student's source mapping is created it is never revisited — but the
+generic mechanism supports it for any future caller; see
+`tests/integration/test_sync_issues.py` for the lifecycle proven
+directly against `open_issue`/`resolve_issue`.)
+
 For the current unresolved-student case:
 `source_system='attendance'`, `issue_type='UNRESOLVED_STUDENT'`,
 `source_entity='student'`, `source_id` = the Attendance student's source
