@@ -27,7 +27,13 @@ from app.integration.attendance.models.staging import (
 )
 from app.integration.attendance.staging_writer import SOURCE_SYSTEM
 from app.integration.attendance.validation import resolve_moodle_course_id
+from app.integration.issues import open_issue, resolve_issue
 from app.integration.models import AttendanceRecordSource, AttendanceSessionSource, StudentSource
+
+#: integration.sync_issues identity for an Attendance student whose
+#: account_number doesn't resolve to any academic student yet.
+UNRESOLVED_STUDENT_ISSUE_TYPE = "UNRESOLVED_STUDENT"
+STUDENT_SOURCE_ENTITY = "student"
 
 
 @dataclass
@@ -35,6 +41,7 @@ class MergeCounters:
     rows_inserted: int = 0
     rows_updated: int = 0
     rows_unchanged: int = 0
+    rows_skipped: int = 0
 
 
 @dataclass
@@ -49,8 +56,25 @@ def _reconcile_students(
 ) -> dict[str, int]:
     """Attendance never creates a canonical student. It only creates (or
     refreshes) a source mapping pointing at the existing academic.students
-    row resolved by account_number — validate_staged_batch already
-    confirmed that resolution is unambiguous.
+    row resolved by account_number.
+
+    validate_staged_batch already ruled out ambiguous resolution (more
+    than one academic match) — that would have failed the batch before
+    reaching here. Zero matches is different: it is expected and not
+    blocking. That student is skipped (rows_skipped += 1, no mapping
+    created, not present in the returned map) rather than failing the
+    batch — Moodle just hasn't created them yet. Because Phase 3 always
+    does a full extraction, the very next sync re-attempts this same
+    reconciliation from scratch, so once the student exists in
+    academic.students, this mapping — and, via _merge_records, their
+    entire attendance history — is created automatically with no data
+    ever lost in between.
+
+    A skip is not just a counter: an OPEN integration.sync_issues row
+    (issue_type="UNRESOLVED_STUDENT") is upserted so the inconsistency
+    stays visible and queryable rather than disappearing into
+    rows_skipped. The first time a student resolves, any matching OPEN
+    issue is marked RESOLVED (and retained — never deleted).
     """
     academic_id_by_source_id: dict[str, int] = {}
 
@@ -71,7 +95,26 @@ def _reconcile_students(
         if existing is None:
             academic_student_id = connection.execute(
                 select(Student.id).where(Student.account_number == row.account_number)
-            ).scalar_one()
+            ).scalar_one_or_none()
+
+            if academic_student_id is None:
+                counters.rows_skipped += 1
+                open_issue(
+                    connection,
+                    source_system=SOURCE_SYSTEM,
+                    issue_type=UNRESOLVED_STUDENT_ISSUE_TYPE,
+                    source_entity=STUDENT_SOURCE_ENTITY,
+                    source_id=row.source_id,
+                    reference_value=row.account_number,
+                    message=(
+                        f"attendance account_number {row.account_number!r} "
+                        f"(source_id={row.source_id!r}) does not resolve to any "
+                        "academic student yet"
+                    ),
+                    now=now,
+                )
+                continue
+
             connection.execute(
                 insert(StudentSource).values(
                     student_id=academic_student_id,
@@ -81,6 +124,14 @@ def _reconcile_students(
                     last_seen_at=now,
                     synced_at=now,
                 )
+            )
+            resolve_issue(
+                connection,
+                source_system=SOURCE_SYSTEM,
+                issue_type=UNRESOLVED_STUDENT_ISSUE_TYPE,
+                source_entity=STUDENT_SOURCE_ENTITY,
+                source_id=row.source_id,
+                now=now,
             )
             counters.rows_inserted += 1
             academic_id_by_source_id[row.source_id] = academic_student_id
@@ -191,6 +242,13 @@ def _merge_records(
     student_academic_id_by_source_id: Mapping[str, int],
     session_academic_id_by_source_id: Mapping[str, int],
 ) -> None:
+    """A record whose student_source_id isn't in
+    student_academic_id_by_source_id belongs to a student
+    _reconcile_students skipped (unresolved account_number) — skip it
+    too (rows_skipped += 1), not a KeyError, not a failure. It becomes
+    mergeable automatically on a later sync once that student exists in
+    academic.students.
+    """
     staged = connection.execute(
         select(StagingAttendanceRecord).where(
             StagingAttendanceRecord.source_system == SOURCE_SYSTEM
@@ -198,6 +256,10 @@ def _merge_records(
     ).all()
 
     for row in staged:
+        if row.student_source_id not in student_academic_id_by_source_id:
+            counters.rows_skipped += 1
+            continue
+
         student_id = student_academic_id_by_source_id[row.student_source_id]
         attendance_session_id = session_academic_id_by_source_id[row.session_source_id]
 

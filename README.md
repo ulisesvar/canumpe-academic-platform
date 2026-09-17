@@ -68,7 +68,7 @@ API.
 | `raw_attendance` | Landing representation of selected Attendance source entities, as extracted — faithful, append-only, never validated. Never coordinates/distance. | `students`, `sessions`, `attendances` |
 | `staging` | Normalized/validated candidate rows for one batch, rebuilt on every run. Not a system of record. | `students`, `courses`, `enrollments`, `attendance_students`, `attendance_sessions`, `attendance_records` |
 | `academic` | Curated canonical data. The only schema the Academic API reads from. | `students`, `courses`, `enrollments`, `attendance_sessions`, `attendance_records` |
-| `integration` | Source-identity mappings and pipeline observability (never business data). | `student_sources`, `course_sources`, `enrollment_sources`, `attendance_session_sources`, `attendance_record_sources`, `sync_runs`, `sync_state` |
+| `integration` | Source-identity mappings and pipeline observability (never business data). | `student_sources`, `course_sources`, `enrollment_sources`, `attendance_session_sources`, `attendance_record_sources`, `sync_runs`, `sync_state`, `sync_issues` |
 | `auth` | Reserved for future API authentication. | Empty — no tables yet |
 
 `auth` remains empty — established only for architectural boundaries;
@@ -262,15 +262,144 @@ collecting them by accident.
 **Attendance creates no canonical students or courses.** The canonical
 student population comes from Moodle. An Attendance student reconciles
 to an *existing* `academic.students` row by `account_number` — this
-pipeline never runs `INSERT INTO academic.students`. If an
-`account_number` doesn't resolve to exactly one academic student
-(zero matches, or — structurally prevented by `academic.students`'
-own `UNIQUE(account_number)`, but checked anyway — more than one), the
-whole batch fails rather than creating a student, skipping it, or
-guessing. The mapping itself reuses the existing
-`integration.student_sources` table with `source_system='attendance'` —
-exactly the "moodle / 137 and attendance / 25 both map to
-`academic.students.id = 8`" example from the Phase 1 design.
+pipeline never runs `INSERT INTO academic.students`. The mapping itself
+reuses the existing `integration.student_sources` table with
+`source_system='attendance'` — exactly the "moodle / 137 and attendance
+/ 25 both map to `academic.students.id = 8`" example from the Phase 1
+design. `account_number` resolution has three possible outcomes, and
+only one of them blocks the batch:
+
+| Matches in `academic.students` | Outcome |
+|---|---|
+| Exactly 1 | Normal reconciliation — mapping created/refreshed, that student's attendance records merge. |
+| 0 | **Skip**, not a failure — see below. |
+| More than 1 | Blocking — structurally prevented by `academic.students`' own `UNIQUE(account_number)`, but checked anyway (`app.integration.attendance.validation._reconciliation_issue`). |
+
+**Unresolved students are skipped, not fatal.** An Attendance student
+whose `account_number` doesn't exist in Moodle *yet* must not fail the
+whole batch — that was Phase 3's original behavior and production
+acceptance testing rejected it (one real student existed in Attendance
+before being added to Moodle). Instead, `merge.py`'s
+`_reconcile_students` skips that specific student — no canonical student
+created, no source mapping created — and `_merge_records` skips every
+attendance record belonging to them (`rows_skipped` counts both). Every
+other student/session/record in the batch still merges normally, and the
+run is `SUCCESS`. Because Phase 3 always does a full extraction, the
+very next sync re-attempts this exact reconciliation from scratch: once
+Moodle sync creates that student, the next Attendance sync resolves
+their `account_number`, creates the mapping, and imports their entire
+attendance history — nothing is permanently lost, just delayed.
+
+**Counter semantics** (`integration.sync_runs`, set in
+`app.integration.attendance.sync.run_attendance_sync`):
+
+- `rows_read` — every row extraction returned (students + sessions +
+  attendances), before any check.
+- `rows_valid` — equals `rows_read` whenever `validate_staged_batch`
+  found zero blocking issues for the batch. Validity is a batch-wide,
+  structural/referential judgment (would this batch be safe to attempt
+  merging at all?), independent of whether an individual valid row was
+  actually merged.
+- `rows_skipped` — valid rows deliberately not merged because their
+  canonical anchor doesn't exist yet: an unresolved Attendance student,
+  plus every attendance record belonging to them. Not an error.
+- `rows_inserted`/`rows_updated`/`rows_unchanged` — as in the Moodle
+  pipeline, driven by `source_hash` comparison, counted across students,
+  sessions, and records together.
+
+**Blocking error vs. operational issue.** The platform now has two
+distinct ways a sync can react to a problem:
+
+- **Blocking error** — the whole batch fails (`sync_runs.status =
+  'FAILED'`), `academic` is left exactly as it was, and nothing is
+  learned from this batch. Reserved for things that indicate the source
+  data or the batch itself can't be trusted: duplicate Attendance
+  `account_number`, ambiguous canonical resolution (>1 academic match),
+  duplicate source identity, a broken session/student reference, a
+  duplicate student/session attendance, or a missing
+  `ATTENDANCE_MOODLE_COURSE_ID` mapping.
+- **Operational issue** — the batch still succeeds
+  (`sync_runs.status = 'SUCCESS'`); the specific inconsistency is
+  recorded as a row in `integration.sync_issues` instead of aborting
+  everything. Currently the only such case is an unresolved Attendance
+  student (0 academic matches) — expected, not a data problem, just
+  "Moodle hasn't caught up yet."
+
+**`integration.sync_issues`** (generic — see `app.integration.issues`;
+not specific to Attendance or any one `source_system`) makes an
+operational issue visible and queryable instead of it disappearing into
+`rows_skipped`. Identity is `UNIQUE(source_system, issue_type,
+source_entity, source_id)`, so reprocessing the same inconsistency every
+30 minutes upserts the same row rather than inserting a new one each
+time: `first_seen_at` is set once, on the initial insert;
+`last_seen_at`/`reference_value`/`message` are refreshed explicitly on
+every subsequent occurrence (never an ORM/Core `onupdate`, no triggers —
+same invariant as everywhere else in this platform). `status` is
+`OPEN`/`RESOLVED` (`CHECK` constraint); once the underlying student
+resolves, `app.integration.attendance.merge` finds the matching `OPEN`
+row and sets `status='RESOLVED'` with an explicit `resolved_at` — the
+row is **never deleted**, so resolved issues remain as permanent
+history.
+
+**Reopen semantics.** The same row supports the full cycle indefinitely:
+`OPEN → OPEN` (repeat occurrences while still unresolved: a no-op beyond
+refreshing `last_seen_at`) → `RESOLVED` (`resolve_issue`) → `OPEN` again,
+*if the identical inconsistency recurs* → `RESOLVED` again, and so on.
+`open_issue`'s `ON CONFLICT DO UPDATE` unconditionally sets
+`status='OPEN'` and `resolved_at=NULL` on every call, regardless of the
+row's current status — so a previously `RESOLVED` row that reappears is
+correctly reopened rather than incorrectly left `RESOLVED`.
+`first_seen_at` and the row's `id` never change across any of this;
+`reference_value`/`message` are refreshed each time. No new row is ever
+inserted for an identity that already exists, in either direction. (The
+current Attendance pipeline can't actually trigger a reopen — once a
+student's source mapping is created it is never revisited — but the
+generic mechanism supports it for any future caller; see
+`tests/integration/test_sync_issues.py` for the lifecycle proven
+directly against `open_issue`/`resolve_issue`.)
+
+For the current unresolved-student case:
+`source_system='attendance'`, `issue_type='UNRESOLVED_STUDENT'`,
+`source_entity='student'`, `source_id` = the Attendance student's source
+id, `reference_value` = their `account_number`.
+
+*Transaction behavior*: both `open_issue` and `resolve_issue`
+(`app/integration/issues.py`) take an open `connection` and are only
+ever called from inside the same transaction as the canonical merge
+(`app.integration.attendance.merge`, itself called from within
+`sync.py`'s `with app_engine.begin()` block). An `OPEN` issue row —
+like the canonical writes and the `sync_state` watermark it sits
+alongside — therefore only becomes visible once that transaction
+actually commits; if the merge rolls back for any reason, the issue
+write rolls back with it. There is no separate transaction boundary for
+issue tracking to reason about.
+
+Example query — everything currently open, most recently seen first:
+
+```sql
+SELECT
+    source_system,
+    issue_type,
+    source_id,
+    reference_value,
+    status,
+    first_seen_at,
+    last_seen_at,
+    resolved_at
+FROM integration.sync_issues
+WHERE status = 'OPEN'
+ORDER BY last_seen_at DESC;
+```
+
+Look up whether a specific student has ever had an issue, by account
+number:
+
+```sql
+SELECT *
+FROM integration.sync_issues
+WHERE issue_type = 'UNRESOLVED_STUDENT'
+  AND reference_value = '321167907';
+```
 
 **Course association through the Moodle mapping.** The Attendance
 source has no course id of its own. `ATTENDANCE_MOODLE_COURSE_ID`

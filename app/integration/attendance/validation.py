@@ -6,6 +6,14 @@ require seeing the whole batch at once, plus two cross-database checks
 that can only happen here: account_number reconciliation against
 academic.students, and course resolution through the Moodle course
 mapping. A blocking issue here must abort the entire batch.
+
+One reconciliation outcome is deliberately NOT blocking: an
+account_number that resolves to zero academic students (Moodle hasn't
+created that student yet). That case is a per-student SKIP handled by
+merge.py's _reconcile_students, not a batch failure — see
+_reconciliation_issue below. Resolving to *more than one* academic
+student remains blocking (structurally prevented by academic.students'
+own UNIQUE(account_number), but checked here too, defensively).
 """
 
 from sqlalchemy import func, select
@@ -34,6 +42,21 @@ def resolve_moodle_course_id(connection: Connection, moodle_course_id: int) -> i
             CourseSource.source_id == str(moodle_course_id),
         )
     ).scalar_one_or_none()
+
+
+def _reconciliation_issue(account_number: str, match_count: int) -> str | None:
+    """The only account_number resolution outcome that blocks the batch:
+    genuinely ambiguous (more than one academic student). Zero matches is
+    not blocking — merge.py skips that student (and their attendance
+    records) instead, since Moodle may simply not have created them yet;
+    a later full sync picks them up automatically once it does.
+    """
+    if match_count > 1:
+        return (
+            f"attendance account_number {account_number!r} resolves ambiguously to "
+            f"{match_count} academic students (expected exactly 1)"
+        )
+    return None
 
 
 def validate_staged_batch(connection: Connection, moodle_course_id: int) -> list[str]:
@@ -67,11 +90,9 @@ def validate_staged_batch(connection: Connection, moodle_course_id: int) -> list
             .select_from(Student)
             .where(Student.account_number == account_number)
         ).scalar_one()
-        if match_count != 1:
-            issues.append(
-                f"attendance account_number {account_number!r} resolves to {match_count} "
-                "academic students (expected exactly 1)"
-            )
+        issue = _reconciliation_issue(account_number, match_count)
+        if issue:
+            issues.append(issue)
 
     student_source_ids = set(
         connection.execute(

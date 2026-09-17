@@ -101,6 +101,20 @@ def run_attendance_sync(
             )
             # Same transaction as the merge: SUCCESS is never visible
             # unless the academic writes above actually committed.
+            #
+            # Counter semantics:
+            # - rows_read: every row extraction returned (students +
+            #   sessions + attendances), before any check.
+            # - rows_valid: rows_read, whenever validate_staged_batch
+            #   found zero blocking issues for the batch — validity is a
+            #   batch-wide, structural/referential judgment, separate
+            #   from whether a valid row was actually merged.
+            # - rows_skipped (counters.rows_skipped, from merge_batch):
+            #   valid rows deliberately not merged because their
+            #   canonical anchor doesn't exist yet — an Attendance
+            #   student whose account_number resolves to zero academic
+            #   students, plus every attendance record that belongs to
+            #   that student. Not an error; see merge.py.
             mark_sync_run_success(
                 connection,
                 run_id,
