@@ -17,7 +17,9 @@ from app.academic.models import (
     AttendanceSession,
     Course,
     Enrollment,
+    GradeCategory,
     GradeItem,
+    GradeItemEvaluation,
     Student,
     StudentGrade,
 )
@@ -125,3 +127,33 @@ def revoke_test_key_by_plaintext(engine: Engine, plaintext: str) -> None:
             select(ApiKey.id).where(ApiKey.key_hash == hash_key(plaintext))
         ).scalar_one()
         revoke_key(session, api_key_id=api_key_id)
+
+
+def create_grade_category(
+    engine: Engine, *, course_id: int, name: str, weight_percent: Decimal | int, sort_order: int
+) -> int:
+    with engine.begin() as connection:
+        return connection.execute(
+            insert(GradeCategory)
+            .values(
+                course_id=course_id, name=name, weight_percent=weight_percent, sort_order=sort_order
+            )
+            .returning(GradeCategory.id)
+        ).scalar_one()
+
+
+def assign_grade_item_to_category(
+    engine: Engine,
+    *,
+    grade_item_id: int,
+    category_id: int,
+    counts_toward_current_grade: bool = True,
+) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            insert(GradeItemEvaluation).values(
+                grade_item_id=grade_item_id,
+                category_id=category_id,
+                counts_toward_current_grade=counts_toward_current_grade,
+            )
+        )

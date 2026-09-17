@@ -25,6 +25,7 @@ from app.api.schemas.students import (
     StudentSummaryResponse,
 )
 from app.repositories import student_read_repository as repo
+from app.services.grade_normalization import normalize_score, round2_or_none
 
 
 class StudentNotFoundError(Exception):
@@ -94,6 +95,15 @@ def get_student_grades(db: Session, student_id: int) -> StudentGradeResponse:
                 activity_type=row["activity_type"],
                 grade=float(row["grade"]) if row["grade"] is not None else None,
                 max_grade=float(row["max_grade"]),
+                score_100=round2_or_none(normalize_score(row["grade"], row["max_grade"])),
+                category_id=row["category_id"],
+                category_name=row["category_name"],
+                category_weight_percent=(
+                    float(row["category_weight_percent"])
+                    if row["category_weight_percent"] is not None
+                    else None
+                ),
+                counts_toward_current_grade=row["counts_toward_current_grade"] or False,
             )
             for row in rows
         ],

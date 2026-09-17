@@ -31,10 +31,13 @@ foundation, two ingestion pipelines — Moodle (students, courses,
 enrollments, and — since Phase 4 — grade items/student grades) and
 Attendance (attendance sessions/records only — Attendance never creates
 students or courses of its own; see below) — a read-only Academic API
-over the resulting canonical data (Phase 5), and, since Phase 6, API-key
-authentication/authorization protecting it.
+over the resulting canonical data (Phase 5), API-key
+authentication/authorization protecting it (Phase 6), and, since
+Phase 7, a weighted evaluation engine that explains a student's current
+grade — evaluation categories, weights, and the calculation itself are
+owned by this platform, never by Moodle.
 
-## Current phase: Phase 6 — API Key Authentication
+## Current phase: Phase 7 — Weighted Evaluation Engine
 
 Phase 0 built the project skeleton and shipped a validated production
 deployment (`GET /health` only). Phase 1 added the database foundation.
@@ -51,7 +54,14 @@ explicit canonical `student_id`s. Phase 6 closes that gap: every request
 now needs an `X-API-Key`, resolved to either a STUDENT identity (scoped
 to `/me/*`, their own data only) or an ADMIN identity (scoped to
 `/students/{student_id}/*`, any student) — see "API key authentication
-(Phase 6)" below for the full model.
+(Phase 6)" below for the full model. Phase 7 adds a weighted evaluation
+engine on top of that authenticated API: evaluation categories, their
+weights, and which grade items count toward the current grade are
+configuration this platform owns (never inferred from Moodle, never
+written back to it), and a new calculation layer turns that
+configuration plus the canonical grades already ingested into a fully
+transparent, reconstructable "current grade" — see "Weighted evaluation
+engine (Phase 7)" below.
 
 ### Data flow (target architecture)
 
@@ -935,6 +945,306 @@ operational step this phase does not perform.
   the API still never queries Moodle or Attendance and never receives
   their credentials
 
+### Weighted evaluation engine (Phase 7)
+
+Phase 5 gave students their raw, atomic grades. Phase 7 answers the
+question those raw numbers can't answer on their own: *"why do I
+currently have a 7.2?"* It does this without ever replacing the atomic
+data — `GET /me/grades` and `GET /me/attendance` remain first-class,
+unabridged endpoints; Phase 7 only enriches the grades response and
+adds new, purely additive endpoints on top.
+
+**This platform, not Moodle, owns evaluation configuration.** Moodle
+remains the system of record for students, courses, grade items, and
+recorded grades. It has never been asked, and is never consulted, for
+category weights, the grade-item-to-category mapping, or whether an
+item currently counts toward a grade — those are configuration this
+platform defines and stores itself (`academic.grade_categories`,
+`academic.grade_item_evaluation`), and they are never written back to
+Moodle. The evaluation engine also never touches Attendance or
+Telegram data; "current grade" is a Moodle-grades-only concept.
+
+**0–100 normalization, computed, never stored raw.** Every grade item
+has its own `max_grade` (20, 100, whatever the instructor set in
+Moodle); comparing or averaging across items only makes sense on a
+common scale. `score_100 = (grade / max_grade) * 100` is computed in
+the calculation layer (`app/services/grade_normalization.py`) on every
+read — the original `grade`/`max_grade` are never overwritten or
+dropped, so a client always has both the source numbers and the
+normalized one. Example: `grade=75, max_grade=100` → `score_100=75.0`;
+`grade=18, max_grade=20` → `score_100=90.0`.
+
+**`null` is not `0` — enforced from the database up through the API.**
+An ungraded item (`academic.student_grades.grade IS NULL`) means "not
+graded yet," not "earned zero." `score_100` for such an item is `null`,
+never `0.0`; a `null`-grade item is excluded from its category's
+average entirely (see below) rather than counted as a zero. A grade
+that really is `0` is preserved as the number `0` at every layer and
+included normally. This is the same rule Phase 5 already enforced for
+raw grades ("No invented aggregates"); Phase 7 extends it through
+normalization and category averaging so it can never be reintroduced
+by a later calculation.
+
+**Evaluation categories** (`academic.grade_categories`): a course's
+grading scheme is a flat list of named categories, each with a
+`weight_percent` (`NUMERIC(5,2)`, never a float — so `12.50 + 87.50`
+is exactly `100.00`, not `99.99999999999999`) and a `sort_order` for
+display. **A course's category weights must sum to exactly 100** —
+90 or 110 is rejected, decimals like `25.00`/`12.50` are fine. This is
+a cross-row invariant (the sum of every row for a course), so it can't
+be a single-row `CHECK` constraint; it's enforced in
+`app.services.evaluation_service` before any write ever reaches the
+database.
+
+**Grade-item assignment** (`academic.grade_item_evaluation`): each
+grade item maps to **at most one** category — enforced structurally by
+making `grade_item_id` the table's primary key (and foreign key to
+`academic.grade_items`), not just a unique index — plus an explicit
+`counts_toward_current_grade` boolean. That boolean is the *only* thing
+that decides whether an item is included in a current-grade
+calculation. It is never inferred from whether the item has a due
+date, whether "enough time" has passed, whether another student
+already has a grade for it, or from the grade being `NULL` — an
+instructor (via the future admin app; Phase 7 ships the API only, see
+below) sets it explicitly, and a not-yet-due assignment with
+`counts_toward_current_grade=false` stays visible in `/me/grades` with
+its real `null` grade, it simply doesn't participate in the current
+grade yet.
+
+**Real Moodle activity types, never relabeled.** An item's
+`activity_type` (`assign`, `quiz`, ...) already comes straight from
+Moodle since Phase 4 and is passed through unchanged — Phase 7 never
+assumes `quiz` means "exam" or `assign` means "homework." Meaning comes
+from the *category* an instructor assigns the item to (its `name`,
+freely chosen), combined with the real activity type, not from
+guessing at Moodle's internal module names. This is also why Phase 7
+deliberately does **not** add `/me/tasks` or `/me/exams` — a client
+that wants "just the exams" filters the enriched `/me/grades` list by
+`category_name`/`activity_type` itself; the API stays one general
+endpoint, not one per possible grouping.
+
+**`GET /me/grades` — enriched, not replaced.** The existing atomic
+response gains five fields per item; nothing already there was removed
+or renamed:
+
+```json
+{
+  "course_id": 1,
+  "grade_item_id": 12,
+  "name": "Tarea 01",
+  "activity_type": "assign",
+  "grade": 75.0,
+  "max_grade": 100.0,
+  "score_100": 75.0,
+  "category_id": 3,
+  "category_name": "Tasks",
+  "category_weight_percent": 30.0,
+  "counts_toward_current_grade": true
+}
+```
+
+An item Moodle hasn't graded yet, and/or one an instructor hasn't
+configured a category for, still appears — `score_100`/`category_id`/
+`category_name`/`category_weight_percent` are simply `null`, and
+`counts_toward_current_grade` is `false`:
+
+```json
+{
+  "course_id": 1,
+  "grade_item_id": 13,
+  "name": "Tarea 02",
+  "activity_type": "assign",
+  "grade": null,
+  "max_grade": 100.0,
+  "score_100": null,
+  "category_id": null,
+  "category_name": null,
+  "category_weight_percent": null,
+  "counts_toward_current_grade": false
+}
+```
+
+**`GET /me/attendance` is untouched.** Phase 7 does not use attendance
+for anything — no course grade ever depends on it, and the endpoint
+still returns the same atomic, never-summarized event list Phase 5
+defined.
+
+**Category score: an equal-weight average of graded, counted items
+only.** Within a category, Phase 7 does not model per-item weights
+(a future phase might); every currently-counted, actually-graded item
+in the category contributes equally to that category's `score_100`.
+`null`-graded items are excluded from the average, not treated as `0`.
+Example: `Tarea01=80, Tarea02=100, Tarea03=70` (all counted, all
+graded) → category score `= (80 + 100 + 70) / 3 = 83.33`.
+
+**Category contribution: how many of the course's 100 points this
+category is worth so far.**
+`category_contribution = category_score_100 × category_weight_percent / 100`.
+Continuing the example, if Tasks is weighted 30%:
+`83.33 × 30 / 100 = 25.00` points toward the course's eventual 100.
+
+**A category with nothing gradable yet simply doesn't participate —
+it is never treated as a zero.** A category counts toward the overall
+calculation only if it has at least one grade item with
+`counts_toward_current_grade=true` **and** an actual non-`null` grade
+recorded for the student. A category with no items yet, or whose only
+items are still ungraded, is "not currently calculable" for that
+student; it contributes nothing to either side of the current-grade
+ratio below — not a `0` score, not a `0` weight.
+
+**Current grade: weighted points earned *of the portion evaluated so
+far* — two different numbers, never confused.** This is the part most
+prone to being computed wrong, so the engine reports all four
+quantities that go into it, not just the final answer:
+
+| Field | Meaning |
+|---|---|
+| `weighted_points_earned` | sum of every calculable category's `contribution_points` — literal points toward the course's 100, earned so far |
+| `evaluated_weight_percent` | sum of `weight_percent` across only the calculable categories — how much of the 100% the course has actually been graded on so far |
+| `current_score_100` | `weighted_points_earned / evaluated_weight_percent × 100` — performance *over the evaluated portion*, not over the whole course |
+| `current_grade_10` | `current_score_100 / 10` — the same figure on the familiar 0–10 scale |
+
+The worked example from the spec, verified end-to-end (service-level
+unit test and a live smoke test against a running container):
+
+```
+Tasks:         weight=30%, score=80  → contribution=24
+Exams:         weight=20%, score=60  → contribution=12
+Project:       weight=30%, not yet gradable → excluded
+Participation: weight=20%, no items yet     → excluded
+
+weighted_points_earned    = 24 + 12 = 36
+evaluated_weight_percent  = 30 + 20 = 50
+current_score_100         = 36 / 50 × 100 = 72.0
+current_grade_10          = 72.0 / 10 = 7.2
+```
+
+`36` is *not* "the current grade" — it's raw points earned toward a
+100-point course where only half the weight has been evaluated so far.
+`72.0`/`7.2` is the actual answer to "how am I doing," and the API
+returns both, plus every category-level number needed to reconstruct
+either one by hand.
+
+**If nothing is calculable yet, the grade is `null` — never `0`.** If
+`evaluated_weight_percent` would be `0` (no category has any counted,
+graded item), `current_score_100` and `current_grade_10` are both
+`null`. Dividing by zero is never attempted, and an empty course is
+never reported as a failing `0.0`.
+
+**Decimal throughout, rounded only at the boundary.** Every
+intermediate value — normalized scores, category averages, weights,
+contributions, the running `weighted_points_earned`/
+`evaluated_weight_percent` totals — is `Decimal` arithmetic
+(`app/services/evaluation_service.py`), never `float`, and never
+rounded until the final Pydantic response model is built. Displayed
+figures (`score_100`, `weight_percent`, `contribution_points`,
+`current_score_100`, `current_grade_10`) are rounded to 2 decimal
+places (`round()`, half-up) only at that last step, so a chain of
+category averages can't drift from repeated intermediate rounding.
+
+**`GET /me/evaluation`** — the full, transparent breakdown for the
+caller's own current grade (student key only; `course_id` is optional
+when the student is enrolled in exactly one course):
+
+```json
+{
+  "student_id": 1,
+  "course_id": 1,
+  "weighted_points_earned": 36.0,
+  "evaluated_weight_percent": 50.0,
+  "current_score_100": 72.0,
+  "current_grade_10": 7.2,
+  "categories": [
+    {
+      "category_id": 1,
+      "name": "Tasks",
+      "weight_percent": 30.0,
+      "category_score_100": 80.0,
+      "contribution_points": 24.0,
+      "counted_items": 1,
+      "graded_items": 1,
+      "ungraded_items": 0,
+      "items": [
+        {
+          "grade_item_id": 10,
+          "name": "Tarea 01",
+          "activity_type": "assign",
+          "grade": 80.0,
+          "max_grade": 100.0,
+          "score_100": 80.0
+        }
+      ]
+    }
+  ]
+}
+```
+
+Every number above the `categories` list is reconstructable from the
+numbers inside it — nothing in the response depends on a calculation
+the caller can't reproduce.
+
+**`GET /students/{student_id}/evaluation`** — the identical breakdown,
+admin-only, for instructor use investigating a specific student. A
+student key gets `403`; an unknown `student_id` gets `404`; the
+underlying calculation is the exact same `evaluation_service` function
+Phase 7's `/me/evaluation` uses.
+
+**`GET/PUT /admin/courses/{course_id}/evaluation-scheme`** — admin-only
+configuration of a course's categories and grade-item assignments.
+`GET` returns the current scheme plus any canonical grade items not
+yet assigned to a category (useful for building an admin UI later —
+none is built in Phase 7 itself). `PUT` replaces the **entire** scheme
+atomically: the full category list (with their grade-item assignments)
+is validated as a whole — weights sum to exactly 100, no grade item
+assigned twice, every referenced grade item exists and belongs to this
+course — and only if the whole payload is valid does anything get
+written; an invalid `PUT` changes nothing (`InvalidEvaluationSchemeError`
+→ `400`, with no partial category/assignment rows left behind). This
+is deliberately whole-scheme replacement rather than small per-category
+CRUD endpoints, matching the reality that categories and weights are
+edited together, not one field at a time.
+
+**Migration `0008_evaluation_engine`** adds exactly the two tables
+above (`academic.grade_categories`, `academic.grade_item_evaluation`)
+— no UI-specific table, no change to any existing table.
+
+**Authorization, unchanged in shape from Phase 6.** A student key
+reads its own atomic grades/attendance/evaluation and nothing else; it
+can never read another student's evaluation and never call any
+`/admin/*` route (`403`). An admin key can read any student's
+evaluation and read/replace any course's scheme, but has no `/me/*`
+identity of its own (`403` on `/me/evaluation`, same as every other
+`/me/*` route since Phase 6).
+
+**No UI.** Phase 7 is API-only, on purpose — no Streamlit page, no
+React app, no professor dashboard ships in this repository. The API is
+designed so a future, separate application (a student-facing dashboard,
+an instructor tool, anything else) can be built entirely against it;
+students are not expected to compute their own current grade by hand,
+but nothing in this response *requires* a client to trust the final
+number without being able to check it.
+
+### What Phase 7 does not implement yet
+
+- Any UI — no dashboard, no admin page for editing evaluation schemes;
+  `PUT /admin/courses/{course_id}/evaluation-scheme` exists only as an
+  API a future admin tool will call
+- Per-item weights *within* a category (e.g. "this quiz counts double
+  its neighbors") — Phase 7 is equal-weight averaging only within a
+  category; the category itself already has its own weight
+- Drop-lowest-score, extra-credit, or any other Moodle gradebook rule
+  beyond plain weighted averaging
+- What-if / projected-grade calculations ("what do I need on the final
+  to get an 8.0?") — Phase 7 reports the current grade only
+- Historical tracking of how a category's or course's current grade
+  changed over time — every call recomputes from the latest canonical
+  grades, there is no snapshot/history table
+- Bulk/CSV import of an evaluation scheme — `PUT` takes one course's
+  full scheme as JSON; there is no multi-course or spreadsheet path
+- A course with no configured scheme at all still returns `null`
+  current-grade fields correctly, but there's no endpoint yet that
+  lists which courses are missing a scheme entirely
+
 ## Developer workstation vs. production host
 
 These are deliberately different environments. Note the one deliberate
@@ -1354,7 +1664,14 @@ completely clean slate.
   scores — the read API deliberately reports only counts a `COUNT`
   query can answer correctly; see the README's "No invented aggregates"
 - Absence tracking / an expected-session-roster model
-- Weighted grade categories, the course total/aggregate grades, or any
-  other part of Moodle's full gradebook beyond real module activities
-- Historical grade tracking and CACEI evidence generation
-- Any write/CRUD endpoint of any kind — every route is strictly read-only
+- The complete Moodle gradebook beyond weighted category averaging —
+  drop-lowest, extra credit, per-item weights within a category, and
+  what-if/projected-grade calculations are all still deferred; see
+  "What Phase 7 does not implement yet" above for the current state of
+  weighted evaluation
+- Historical grade tracking (including of a calculated current grade)
+  and CACEI evidence generation
+- Any UI for editing an evaluation scheme, or any other admin/student
+  dashboard — `PUT /admin/courses/{course_id}/evaluation-scheme`
+  (Phase 7) is the only write endpoint that exists, and it has no UI
+  in front of it yet
