@@ -13,6 +13,7 @@ never from a path parameter.
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from app.api.schemas.evaluation import StudentEvaluationResponse
 from app.api.schemas.students import (
     StudentAttendanceResponse,
     StudentCourseResponse,
@@ -21,6 +22,7 @@ from app.api.schemas.students import (
 )
 from app.auth.dependencies import require_admin
 from app.db.session import get_db
+from app.services import evaluation_service
 from app.services import student_read_service as service
 
 router = APIRouter(prefix="/students", tags=["students"], dependencies=[Depends(require_admin)])
@@ -78,3 +80,19 @@ def get_student_grades(student_id: int, db: Session = Depends(get_db)) -> Studen
 )
 def get_student_summary(student_id: int, db: Session = Depends(get_db)) -> StudentSummaryResponse:
     return service.get_student_summary(db, student_id)
+
+
+@router.get(
+    "/{student_id}/evaluation",
+    response_model=StudentEvaluationResponse,
+    summary="Full weighted-evaluation breakdown for any student (admin)",
+    description=(
+        "Same semantics as GET /me/evaluation, for instructor/administrative use. "
+        "If course_id is omitted, defaults to the student's one enrolled course; "
+        "ambiguous or missing enrollment returns 404."
+    ),
+)
+def get_student_evaluation(
+    student_id: int, course_id: int | None = None, db: Session = Depends(get_db)
+) -> StudentEvaluationResponse:
+    return evaluation_service.get_student_evaluation(db, student_id, course_id)

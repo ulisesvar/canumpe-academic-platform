@@ -56,6 +56,24 @@ class GradeEntry(BaseModel):
         description="null means not graded yet; 0 means a real grade of zero. Never conflated."
     )
     max_grade: float
+    score_100: float | None = Field(
+        description=(
+            "(grade / max_grade) * 100, rounded to 2 decimals; null exactly when grade is null."
+        )
+    )
+    category_id: int | None = Field(
+        default=None,
+        description="null when this grade item has no evaluation category configured yet.",
+    )
+    category_name: str | None = None
+    category_weight_percent: float | None = None
+    counts_toward_current_grade: bool = Field(
+        default=False,
+        description=(
+            "Explicit evaluation configuration — false (never inferred) when no "
+            "category is configured for this item yet."
+        ),
+    )
 
 
 class StudentGradeResponse(BaseModel):

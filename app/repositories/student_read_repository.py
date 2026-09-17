@@ -17,7 +17,9 @@ from app.academic.models import (
     AttendanceSession,
     Course,
     Enrollment,
+    GradeCategory,
     GradeItem,
+    GradeItemEvaluation,
     Student,
     StudentGrade,
 )
@@ -75,6 +77,12 @@ def list_student_grades(db: Session, student_id: int) -> Sequence[RowMapping]:
     for — grade stays whatever academic.student_grades.grade holds
     (nullable), never coerced here. Ordered by grade item id for
     deterministic responses.
+
+    Left-joined to the Phase 7 evaluation configuration (a grade item
+    may have none yet): category_id/category_name/category_weight_percent
+    and counts_toward_current_grade are None/None/None/None when
+    unconfigured — the service layer decides how to present that, this
+    query only reports what exists.
     """
     stmt = (
         select(
@@ -84,8 +92,15 @@ def list_student_grades(db: Session, student_id: int) -> Sequence[RowMapping]:
             GradeItem.activity_type,
             GradeItem.max_grade,
             StudentGrade.grade,
+            GradeItemEvaluation.category_id,
+            GradeCategory.name.label("category_name"),
+            GradeCategory.weight_percent.label("category_weight_percent"),
+            GradeItemEvaluation.counts_toward_current_grade,
         )
-        .join(StudentGrade, StudentGrade.grade_item_id == GradeItem.id)
+        .select_from(StudentGrade)
+        .join(GradeItem, GradeItem.id == StudentGrade.grade_item_id)
+        .outerjoin(GradeItemEvaluation, GradeItemEvaluation.grade_item_id == GradeItem.id)
+        .outerjoin(GradeCategory, GradeCategory.id == GradeItemEvaluation.category_id)
         .where(StudentGrade.student_id == student_id)
         .order_by(GradeItem.id)
     )

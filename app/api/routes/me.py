@@ -9,6 +9,7 @@ data — there is no parameter through which one could even try.
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from app.api.schemas.evaluation import StudentEvaluationResponse
 from app.api.schemas.students import (
     StudentAttendanceResponse,
     StudentCourseResponse,
@@ -18,6 +19,7 @@ from app.api.schemas.students import (
 )
 from app.auth.dependencies import require_student
 from app.db.session import get_db
+from app.services import evaluation_service
 from app.services import student_read_service as service
 
 router = APIRouter(prefix="/me", tags=["me"])
@@ -89,3 +91,23 @@ def get_my_summary(
     student_id: int = Depends(require_student), db: Session = Depends(get_db)
 ) -> StudentSummaryResponse:
     return service.get_student_summary(db, student_id)
+
+
+@router.get(
+    "/evaluation",
+    response_model=StudentEvaluationResponse,
+    summary="Full weighted-evaluation breakdown for the authenticated student",
+    description=(
+        "Explains the current grade completely: per-category equal-weight averages, "
+        "contribution points, evaluated weight, and the current 0-100/0-10 grade. "
+        "Every final number is reconstructable from the categories/items in this "
+        "response. If course_id is omitted, defaults to the student's one enrolled "
+        "course; ambiguous or missing enrollment returns 404."
+    ),
+)
+def get_my_evaluation(
+    course_id: int | None = None,
+    student_id: int = Depends(require_student),
+    db: Session = Depends(get_db),
+) -> StudentEvaluationResponse:
+    return evaluation_service.get_student_evaluation(db, student_id, course_id)

@@ -157,6 +157,11 @@ def test_source_ids_are_not_exposed(
         "activity_type",
         "grade",
         "max_grade",
+        "score_100",
+        "category_id",
+        "category_name",
+        "category_weight_percent",
+        "counts_toward_current_grade",
     }
     forbidden_substrings = ("source", "hash", "batch", "sync", "raw_", "moodle")
     body_text = response.text.lower()

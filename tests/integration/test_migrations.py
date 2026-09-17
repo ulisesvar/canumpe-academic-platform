@@ -5,7 +5,8 @@ from tests.conftest import alembic_config
 
 PHASE1_ACADEMIC_TABLES = {"students", "courses", "enrollments"}
 PHASE3_ACADEMIC_TABLES = PHASE1_ACADEMIC_TABLES | {"attendance_sessions", "attendance_records"}
-ACADEMIC_TABLES = PHASE3_ACADEMIC_TABLES | {"grade_items", "student_grades"}
+PHASE6_ACADEMIC_TABLES = PHASE3_ACADEMIC_TABLES | {"grade_items", "student_grades"}
+ACADEMIC_TABLES = PHASE6_ACADEMIC_TABLES | {"grade_categories", "grade_item_evaluation"}
 
 PHASE1_INTEGRATION_TABLES = {
     "student_sources",
@@ -52,6 +53,7 @@ def test_upgrade_head_succeeds_from_empty_database(db_engine: Engine) -> None:
     assert "students" in table_names
     assert "attendance_sessions" in table_names
     assert "grade_items" in table_names
+    assert "grade_categories" in table_names
     assert "api_keys" in inspect(db_engine).get_table_names(schema="auth")
 
 
@@ -194,6 +196,36 @@ def test_expected_tables_and_constraints_are_present(db_engine: Engine) -> None:
     api_keys_indexes = {ix["name"] for ix in inspector.get_indexes("api_keys", schema="auth")}
     assert "uq_api_keys_active_student" in api_keys_indexes
 
+    grade_categories_unique_columns = {
+        tuple(sorted(uc["column_names"]))
+        for uc in inspector.get_unique_constraints("grade_categories", schema="academic")
+    }
+    assert tuple(sorted(("course_id", "name"))) in grade_categories_unique_columns
+    assert tuple(sorted(("course_id", "sort_order"))) in grade_categories_unique_columns
+
+    grade_categories_checks = {
+        ck["name"] for ck in inspector.get_check_constraints("grade_categories", schema="academic")
+    }
+    assert "ck_grade_categories_weight_percent_nonneg" in grade_categories_checks
+    assert "ck_grade_categories_weight_percent_max" in grade_categories_checks
+
+    grade_categories_referred_tables = {
+        fk["referred_table"]
+        for fk in inspector.get_foreign_keys("grade_categories", schema="academic")
+    }
+    assert grade_categories_referred_tables == {"courses"}
+
+    grade_item_evaluation_pk = inspector.get_pk_constraint(
+        "grade_item_evaluation", schema="academic"
+    )
+    assert grade_item_evaluation_pk["constrained_columns"] == ["grade_item_id"]
+
+    grade_item_evaluation_referred_tables = {
+        fk["referred_table"]
+        for fk in inspector.get_foreign_keys("grade_item_evaluation", schema="academic")
+    }
+    assert grade_item_evaluation_referred_tables == {"grade_items", "grade_categories"}
+
 
 def test_downgrade_then_upgrade_is_clean(db_engine: Engine) -> None:
     cfg = alembic_config()
@@ -211,12 +243,32 @@ def test_downgrade_then_upgrade_is_clean(db_engine: Engine) -> None:
     assert "students" in inspect(db_engine).get_table_names(schema="academic")
     assert "attendance_sessions" in inspect(db_engine).get_table_names(schema="academic")
     assert "grade_items" in inspect(db_engine).get_table_names(schema="academic")
+    assert "grade_categories" in inspect(db_engine).get_table_names(schema="academic")
     assert "students" in inspect(db_engine).get_table_names(schema="raw_moodle")
     assert "grade_items" in inspect(db_engine).get_table_names(schema="raw_moodle")
     assert "students" in inspect(db_engine).get_table_names(schema="raw_attendance")
     assert "students" in inspect(db_engine).get_table_names(schema="staging")
     assert "grade_items" in inspect(db_engine).get_table_names(schema="staging")
     assert "api_keys" in inspect(db_engine).get_table_names(schema="auth")
+
+
+def test_downgrade_one_step_from_head_removes_only_evaluation_engine(db_engine: Engine) -> None:
+    cfg = alembic_config()
+
+    try:
+        command.downgrade(cfg, "0007_api_key_auth")
+        academic_tables = set(inspect(db_engine).get_table_names(schema="academic"))
+        assert academic_tables == PHASE6_ACADEMIC_TABLES
+        assert "grade_categories" not in academic_tables
+        assert "grade_item_evaluation" not in academic_tables
+        # Everything 0007 and earlier delivered is untouched.
+        assert set(inspect(db_engine).get_table_names(schema="auth")) == AUTH_TABLES
+        assert set(inspect(db_engine).get_table_names(schema="integration")) == INTEGRATION_TABLES
+    finally:
+        command.upgrade(cfg, "head")
+
+    assert "grade_categories" in inspect(db_engine).get_table_names(schema="academic")
+    assert "grade_item_evaluation" in inspect(db_engine).get_table_names(schema="academic")
 
 
 def test_downgrade_one_step_from_head_removes_only_api_key_auth(db_engine: Engine) -> None:
@@ -226,7 +278,7 @@ def test_downgrade_one_step_from_head_removes_only_api_key_auth(db_engine: Engin
         command.downgrade(cfg, "0006_grades_ingestion")
         assert inspect(db_engine).get_table_names(schema="auth") == []
         # Everything 0006 and earlier delivered is untouched.
-        assert set(inspect(db_engine).get_table_names(schema="academic")) == ACADEMIC_TABLES
+        assert set(inspect(db_engine).get_table_names(schema="academic")) == PHASE6_ACADEMIC_TABLES
         assert set(inspect(db_engine).get_table_names(schema="integration")) == INTEGRATION_TABLES
         assert set(inspect(db_engine).get_table_names(schema="raw_moodle")) == RAW_MOODLE_TABLES
         assert set(inspect(db_engine).get_table_names(schema="staging")) == STAGING_TABLES
