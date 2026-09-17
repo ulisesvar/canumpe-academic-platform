@@ -35,12 +35,12 @@ GRANT SELECT, INSERT ON raw_moodle.courses TO academic_ingest_moodle;
 GRANT SELECT, INSERT ON raw_moodle.enrollments TO academic_ingest_moodle;
 GRANT SELECT, INSERT ON raw_moodle.grade_items TO academic_ingest_moodle;
 GRANT SELECT, INSERT ON raw_moodle.student_grades TO academic_ingest_moodle;
-GRANT USAGE ON
-    SEQUENCE raw_moodle.students_id_seq,
-    SEQUENCE raw_moodle.courses_id_seq,
-    SEQUENCE raw_moodle.enrollments_id_seq,
-    SEQUENCE raw_moodle.grade_items_id_seq,
-    SEQUENCE raw_moodle.student_grades_id_seq
+GRANT USAGE ON SEQUENCE
+    raw_moodle.students_id_seq,
+    raw_moodle.courses_id_seq,
+    raw_moodle.enrollments_id_seq,
+    raw_moodle.grade_items_id_seq,
+    raw_moodle.student_grades_id_seq
     TO academic_ingest_moodle;
 
 -- staging: rebuilt every run, so it also needs UPDATE/DELETE. Only the
@@ -53,12 +53,12 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON staging.courses TO academic_ingest_moodl
 GRANT SELECT, INSERT, UPDATE, DELETE ON staging.enrollments TO academic_ingest_moodle;
 GRANT SELECT, INSERT, UPDATE, DELETE ON staging.grade_items TO academic_ingest_moodle;
 GRANT SELECT, INSERT, UPDATE, DELETE ON staging.student_grades TO academic_ingest_moodle;
-GRANT USAGE ON
-    SEQUENCE staging.students_id_seq,
-    SEQUENCE staging.courses_id_seq,
-    SEQUENCE staging.enrollments_id_seq,
-    SEQUENCE staging.grade_items_id_seq,
-    SEQUENCE staging.student_grades_id_seq
+GRANT USAGE ON SEQUENCE
+    staging.students_id_seq,
+    staging.courses_id_seq,
+    staging.enrollments_id_seq,
+    staging.grade_items_id_seq,
+    staging.student_grades_id_seq
     TO academic_ingest_moodle;
 
 -- integration: source mappings this pipeline reads/writes, plus
@@ -76,15 +76,15 @@ GRANT SELECT, INSERT, UPDATE ON integration.student_grade_sources TO academic_in
 GRANT SELECT, INSERT, UPDATE ON integration.sync_runs TO academic_ingest_moodle;
 GRANT SELECT, INSERT, UPDATE ON integration.sync_state TO academic_ingest_moodle;
 GRANT SELECT, INSERT, UPDATE ON integration.sync_issues TO academic_ingest_moodle;
-GRANT USAGE ON
-    SEQUENCE integration.student_sources_id_seq,
-    SEQUENCE integration.course_sources_id_seq,
-    SEQUENCE integration.enrollment_sources_id_seq,
-    SEQUENCE integration.grade_item_sources_id_seq,
-    SEQUENCE integration.student_grade_sources_id_seq,
-    SEQUENCE integration.sync_runs_id_seq,
-    SEQUENCE integration.sync_state_id_seq,
-    SEQUENCE integration.sync_issues_id_seq
+GRANT USAGE ON SEQUENCE
+    integration.student_sources_id_seq,
+    integration.course_sources_id_seq,
+    integration.enrollment_sources_id_seq,
+    integration.grade_item_sources_id_seq,
+    integration.student_grade_sources_id_seq,
+    integration.sync_runs_id_seq,
+    integration.sync_state_id_seq,
+    integration.sync_issues_id_seq
     TO academic_ingest_moodle;
 
 -- academic: only the tables this pipeline actually merges into — not the
@@ -99,12 +99,12 @@ GRANT SELECT, INSERT, UPDATE ON academic.courses TO academic_ingest_moodle;
 GRANT SELECT, INSERT, UPDATE ON academic.enrollments TO academic_ingest_moodle;
 GRANT SELECT, INSERT, UPDATE ON academic.grade_items TO academic_ingest_moodle;
 GRANT SELECT, INSERT, UPDATE ON academic.student_grades TO academic_ingest_moodle;
-GRANT USAGE ON
-    SEQUENCE academic.students_id_seq,
-    SEQUENCE academic.courses_id_seq,
-    SEQUENCE academic.enrollments_id_seq,
-    SEQUENCE academic.grade_items_id_seq,
-    SEQUENCE academic.student_grades_id_seq
+GRANT USAGE ON SEQUENCE
+    academic.students_id_seq,
+    academic.courses_id_seq,
+    academic.enrollments_id_seq,
+    academic.grade_items_id_seq,
+    academic.student_grades_id_seq
     TO academic_ingest_moodle;
 
 -- Explicitly not granted: CREATE, DROP, ALTER, ownership, superuser,
