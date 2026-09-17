@@ -833,13 +833,14 @@ useradd --system --no-create-home --shell /usr/sbin/nologin academic-sync
 
 **Moodle source** (`academic_sync_moodle`): created manually in
 production PostgreSQL by Moodle's administrators, `SELECT`-only, never
-by application code. Since Phase 4 this account also has `SELECT` on
-`mdl_grade_items`/`mdl_grade_grades` (grades are extracted by the same
-credential, in the same sync process, as students/courses/enrollments —
-there is no separate reference SQL file for this Moodle-side account to
-update, since it is managed entirely by Moodle's own administrators,
-unlike `academic_ingest_moodle` below). `MOODLE_DB_URL` uses `127.0.0.1`
-because the sync runs on the same host as Moodle:
+by application code — see
+`deploy/sql/academic_sync_moodle_grants.example.sql` for the exact
+grants (`mdl_user`/`mdl_user_info_field`/`mdl_user_info_data`,
+`mdl_course`/`mdl_enrol`/`mdl_user_enrolments`, and, since Phase 4,
+`mdl_grade_items`/`mdl_grade_grades` — grades are extracted by the same
+credential, in the same sync process, as students/courses/enrollments).
+`MOODLE_DB_URL` uses `127.0.0.1` because the sync runs on the same host
+as Moodle:
 
 ```
 postgresql+psycopg://academic_sync_moodle:<secret>@127.0.0.1:5432/moodle
