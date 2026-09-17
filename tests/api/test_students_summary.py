@@ -17,7 +17,9 @@ from tests.api.helpers import (
 T0 = datetime(2026, 3, 1, 9, 0, tzinfo=UTC)
 
 
-def test_summary_works_for_a_populated_student(client: TestClient, db_engine: Engine) -> None:
+def test_summary_works_for_a_populated_student(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
     student_id = create_student(db_engine, account_number="9001")
     course_id = create_course(db_engine)
     create_enrollment(db_engine, student_id=student_id, course_id=course_id)
@@ -32,7 +34,7 @@ def test_summary_works_for_a_populated_student(client: TestClient, db_engine: En
     )
     create_student_grade(db_engine, grade_item_id=ungraded_item, student_id=student_id, grade=None)
 
-    response = client.get(f"/students/{student_id}/summary")
+    response = client.get(f"/students/{student_id}/summary", headers=admin_headers)
 
     assert response.status_code == 200
     body = response.json()
@@ -44,11 +46,11 @@ def test_summary_works_for_a_populated_student(client: TestClient, db_engine: En
 
 
 def test_summary_works_for_a_student_with_no_records(
-    client: TestClient, db_engine: Engine
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
 ) -> None:
     student_id = create_student(db_engine, account_number="9002")
 
-    response = client.get(f"/students/{student_id}/summary")
+    response = client.get(f"/students/{student_id}/summary", headers=admin_headers)
 
     assert response.status_code == 200
     assert response.json() == {
@@ -59,7 +61,9 @@ def test_summary_works_for_a_student_with_no_records(
     }
 
 
-def test_summary_does_not_invent_gpa_or_averages(client: TestClient, db_engine: Engine) -> None:
+def test_summary_does_not_invent_gpa_or_averages(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
     student_id = create_student(db_engine, account_number="9003")
     course_id = create_course(db_engine)
     item_id = create_grade_item(db_engine, course_id=course_id)
@@ -67,7 +71,7 @@ def test_summary_does_not_invent_gpa_or_averages(client: TestClient, db_engine: 
         db_engine, grade_item_id=item_id, student_id=student_id, grade=Decimal("30")
     )
 
-    response = client.get(f"/students/{student_id}/summary")
+    response = client.get(f"/students/{student_id}/summary", headers=admin_headers)
 
     body_text = response.text.lower()
     for forbidden in ("gpa", "average", "mean", "score"):
@@ -75,7 +79,7 @@ def test_summary_does_not_invent_gpa_or_averages(client: TestClient, db_engine: 
 
 
 def test_summary_does_not_invent_attendance_percentage(
-    client: TestClient, db_engine: Engine
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
 ) -> None:
     student_id = create_student(db_engine, account_number="9004")
     course_id = create_course(db_engine)
@@ -84,14 +88,16 @@ def test_summary_does_not_invent_attendance_percentage(
         db_engine, attendance_session_id=session_id, student_id=student_id, recorded_at=T0
     )
 
-    response = client.get(f"/students/{student_id}/summary")
+    response = client.get(f"/students/{student_id}/summary", headers=admin_headers)
 
     body_text = response.text.lower()
     for forbidden in ("percentage", "percent", "rate", "risk", "pass", "fail"):
         assert forbidden not in body_text
 
 
-def test_graded_vs_ungraded_count_is_correct(client: TestClient, db_engine: Engine) -> None:
+def test_graded_vs_ungraded_count_is_correct(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
     student_id = create_student(db_engine, account_number="9005")
     course_id = create_course(db_engine)
     graded_ids = [
@@ -107,7 +113,7 @@ def test_graded_vs_ungraded_count_is_correct(client: TestClient, db_engine: Engi
     for item_id in ungraded_ids:
         create_student_grade(db_engine, grade_item_id=item_id, student_id=student_id, grade=None)
 
-    response = client.get(f"/students/{student_id}/summary")
+    response = client.get(f"/students/{student_id}/summary", headers=admin_headers)
 
     body = response.json()
     assert body["grades"]["graded_items"] == 2

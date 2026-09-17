@@ -21,6 +21,7 @@ from app.api.schemas.students import (
     StudentAttendanceResponse,
     StudentCourseResponse,
     StudentGradeResponse,
+    StudentIdentityResponse,
     StudentSummaryResponse,
 )
 from app.repositories import student_read_repository as repo
@@ -37,6 +38,18 @@ class StudentNotFoundError(Exception):
 def _ensure_student_exists(db: Session, student_id: int) -> None:
     if not repo.student_exists(db, student_id):
         raise StudentNotFoundError(student_id)
+
+
+def get_student_identity(db: Session, student_id: int) -> StudentIdentityResponse:
+    """Backs GET /me — student_id here always comes from an
+    authenticated credential (app.auth.dependencies.require_student),
+    never from client input, so "not found" is not a realistic path
+    (the FK from auth.api_keys guarantees the student still exists).
+    """
+    _ensure_student_exists(db, student_id)
+    row = repo.get_student_identity(db, student_id)
+    assert row is not None  # guaranteed by _ensure_student_exists above
+    return StudentIdentityResponse(student_id=row["id"], account_number=row["account_number"])
 
 
 def get_student_courses(db: Session, student_id: int) -> StudentCourseResponse:

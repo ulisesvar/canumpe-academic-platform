@@ -30,10 +30,11 @@ This repository currently implements infrastructure, a database
 foundation, two ingestion pipelines — Moodle (students, courses,
 enrollments, and — since Phase 4 — grade items/student grades) and
 Attendance (attendance sessions/records only — Attendance never creates
-students or courses of its own; see below) — and, since Phase 5, a
-read-only Academic API over the resulting canonical data.
+students or courses of its own; see below) — a read-only Academic API
+over the resulting canonical data (Phase 5), and, since Phase 6, API-key
+authentication/authorization protecting it.
 
-## Current phase: Phase 5 — Academic Read API
+## Current phase: Phase 6 — API Key Authentication
 
 Phase 0 built the project skeleton and shipped a validated production
 deployment (`GET /health` only). Phase 1 added the database foundation.
@@ -43,11 +44,14 @@ read-only extraction → `raw_attendance` → `staging` → validation/
 reconciliation → a transactional merge into `academic`. Phase 4 added
 grade ingestion — grade items and student grades — as part of the same
 Moodle sync process, only for real, module-backed activities (never the
-course total or any category aggregate). Phase 5 adds the first product
-read API: four read-only endpoints over `academic.*` (courses,
-attendance, grades, and a conservative summary), explicit canonical
-`student_id`s and no authentication yet — see "Academic read API
-(Phase 5)" below for the full contract and its deliberate limits.
+course total or any category aggregate). Phase 5 added the first
+product read API: four read-only endpoints over `academic.*` (courses,
+attendance, grades, and a conservative summary) — internal/unauthenticated,
+explicit canonical `student_id`s. Phase 6 closes that gap: every request
+now needs an `X-API-Key`, resolved to either a STUDENT identity (scoped
+to `/me/*`, their own data only) or an ADMIN identity (scoped to
+`/students/{student_id}/*`, any student) — see "API key authentication
+(Phase 6)" below for the full model.
 
 ### Data flow (target architecture)
 
@@ -758,17 +762,164 @@ sync, or has any side effect —
 `tests/api/test_read_only.py` proves canonical row counts are unchanged
 across a full round of requests, including a 404 path.
 
-### What Phase 5 does not implement yet
+### API key authentication (Phase 6)
 
-- Authentication of any kind — no JWT, API keys, OAuth, Telegram auth,
-  `/me` endpoint, or role-based access control (Phase 6)
-- Public exposure — the API remains localhost/internal only, exactly
-  like every phase before it
+Every route except `GET /health` now requires an `X-API-Key` header.
+Implemented in `app/auth/`: `models.py` (the `auth.api_keys` ORM model),
+`api_keys.py` (generation, hashing, issue/rotate/revoke/list —
+persistence, no HTTP), `dependencies.py` (the FastAPI security
+dependencies that authenticate a request), and `manage_api_keys.py`
+(the administrative provisioning CLI — the *only* way a key is ever
+created; there is no endpoint for it).
+
+```
+HTTP request -> X-API-Key -> SHA-256 -> auth.api_keys lookup (read-only)
+    -> role/student resolution -> route-level role check
+```
+
+**Two roles, two audiences.** A **STUDENT** key belongs to exactly one
+canonical `academic.students` row and may only ever call `/me/*` — it
+carries no way to specify *whose* data to return, because `student_id`
+is resolved from the credential itself
+(`app.auth.dependencies.require_student`), never accepted as a path
+parameter, query parameter, or body field. An **ADMIN** key is not tied
+to any student and may call `/students/{student_id}/*` for any
+canonical id (`app.auth.dependencies.require_admin`), intended for
+instructor/administrative use. A key is exactly one role, forever — a
+role is never upgraded or shared between the two endpoint families.
+
+**Header only — never a query parameter, URL, or path segment**, so a
+key never ends up in a server access log or shared/bookmarked URL:
+
+```bash
+curl -H "X-API-Key: canumpe_stu_EXAMPLE_NOT_REAL" http://127.0.0.1:8080/me/grades
+```
+
+**`/me/*` endpoints** — identical product semantics to their `/students/{student_id}/*`
+counterparts (same service/repository code, see "Reuse, not
+duplication" below), scoped to the caller's own identity:
+
+| Endpoint | Returns |
+|---|---|
+| `GET /me` | `{"student_id": 7, "account_number": "423090349"}` — nothing else, never an API key hash/id, integration mapping, or Moodle/Attendance id |
+| `GET /me/courses` | the caller's own enrolled courses |
+| `GET /me/attendance` | the caller's own recorded attendance events |
+| `GET /me/grades` | the caller's own canonical grades |
+| `GET /me/summary` | the caller's own conservative summary |
+
+**Reuse, not duplication.** `/me/*` calls the exact same
+`app.services.student_read_service` functions Phase 5's
+`/students/{student_id}/*` routes use — the only new code is `GET /me`
+itself (a small `get_student_identity` addition to that same service/
+repository, since Phase 5 never needed to expose `account_number`). The
+NULL-vs-zero grade rule, the no-absence-inference attendance rule, and
+the no-invented-aggregates summary rule from Phase 5 therefore apply to
+`/me/*` automatically, not by re-implementation.
+
+**Key format: `canumpe_stu_<random>` / `canumpe_adm_<random>`.**
+Generated by `secrets.token_urlsafe(32)` — 256 bits of
+cryptographically secure randomness, never `random`, a bare UUID, a
+timestamp, an account number, a Telegram id, or a student id (see
+`app.auth.api_keys.generate_student_key`/`generate_admin_key`).
+
+**Plaintext is never stored — shown exactly once.** `auth.api_keys`
+stores only `key_hash` (`SHA-256(plaintext)`, hex, `UNIQUE NOT NULL`)
+and `key_prefix` (a short, non-secret slice of the plaintext — enough
+to recognize a credential in a listing, never enough to reconstruct the
+secret). The plaintext is returned to the operator's terminal exactly
+once, at `issue-*`/`rotate-student` time, by the provisioning CLI — it
+is never logged, never re-derivable from the database, and never
+recoverable if lost. If lost: rotate, don't try to recover it.
+
+**Schema** (migration `0007_api_key_auth`, `auth.api_keys`): `id`,
+`key_hash`, `key_prefix`, `role` (`'student'`/`'admin'`, `CHECK`
+enforced), `student_id` (nullable FK to `academic.students.id`,
+`RESTRICT`), `label`, `created_at`, `revoked_at`. Two constraints do the
+real work, at the database level, not just in application code:
+- `ck_api_keys_role_student_id_consistency`: `role='student'` rows
+  always have a `student_id`; `role='admin'` rows never do.
+- `uq_api_keys_active_student`: a **partial unique index** on
+  `student_id` where `role='student' AND revoked_at IS NULL` — at most
+  one *active* student key per student, at any time. Rotation (not a
+  second `issue-student`) is the supported way to replace one. Admin
+  rows are unaffected (multiple `NULL`s never conflict in a unique
+  index), so several admin keys may coexist.
+
+**Provisioning is CLI-only — there is no endpoint that creates a key.**
+Run with the existing application image, never a host-native Python
+install:
+
+```bash
+docker compose -f compose.prod.yml run --rm api \
+    python -m app.auth.manage_api_keys issue-student --account-number 423090349
+
+python -m app.auth.manage_api_keys issue-admin --label "Ulises"
+python -m app.auth.manage_api_keys rotate-student --account-number 423090349
+python -m app.auth.manage_api_keys revoke --id 3
+python -m app.auth.manage_api_keys list
+```
+
+`issue-student` resolves the account number, fails clearly if it
+doesn't exist (`StudentNotFoundError`) or if the student already has an
+active key (`ActiveStudentKeyExistsError` — use `rotate-student`
+instead), then prints the plaintext key and its id/prefix once.
+`rotate-student` revokes every currently-active key for that student
+and issues a new one in the same transaction, so a failure partway
+through never leaves the student locked out with no key at all.
+`revoke` sets `revoked_at`; it never deletes the row — credential
+history is permanent. `list` prints only safe metadata (id, prefix,
+role, the associated account number or label, status, `created_at`) —
+never a plaintext key, never a full `key_hash`.
+
+**HTTP semantics — every authentication failure looks identical.**
+Missing, malformed, unknown, and revoked keys all return the exact same
+generic `401` (`{"detail": "Invalid or missing API key"}`) — a caller
+can never learn whether a specific key exists by observing a different
+error. A *valid* key used against the wrong endpoint family (a STUDENT
+key on `/students/{student_id}/*`, or an ADMIN key on `/me/*`) returns
+`403` naming the role that *was* required (`"Admin API key required"` /
+`"Student API key required"`) — the credential is real, just not
+authorized for that route. An admin key against an unknown
+`student_id` still returns the Phase 5 `404`.
+
+**Authentication is read-only.** `get_active_key_by_hash` (used on
+every request) only ever does a `SELECT` — there is no `last_used_at`
+column and no per-request write of any kind; usage telemetry, if ever
+needed, is a later phase's problem, not this one's.
+
+**Manual, out-of-band distribution — no Telegram integration yet.**
+Keys are issued by an instructor/admin running the CLI directly and
+handed to the student through Moodle, email, paper, or another trusted
+channel. A future Attendance-bot `/apikey` command *may* eventually
+wrap this same provisioning capability, but Phase 6 does not touch the
+bot, its Telegram handlers, its database, or any Telegram identity
+mapping — that integration is explicitly out of scope here.
+
+**No public exposure yet.** The API is still localhost/internal only —
+authentication had to exist and be accepted in production *before* any
+future Nginx/Cloudflare Tunnel exposure, which is a separate
+operational step this phase does not perform.
+
+### What Phase 6 does not implement yet
+
+- Public exposure of the API — still localhost/internal only; that's a
+  separate later operational step, after production acceptance of
+  authentication itself
+- A Telegram `/apikey` command or any other bot/Telegram change — keys
+  are distributed manually (Moodle, email, paper) for now
+- Usage/audit telemetry (e.g. `last_used_at`) — authentication stays a
+  pure read on every request
+- Key expiration or scheduled rotation — a key is active until
+  explicitly revoked or rotated
+- Any endpoint that creates, lists, or revokes a key over HTTP —
+  provisioning is CLI-only, run against the application image
 - GPA, course averages, attendance percentages, pass/fail status, or
-  risk scores — see "No invented aggregates" above for why
+  risk scores — unchanged from Phase 5; see "No invented aggregates"
+  further up
 - Absence tracking or any session/roster model that would make an
   attendance percentage safe to compute
-- CRUD or write endpoints of any kind — Phase 5 is strictly read-only
+- CRUD or write endpoints of any kind — every route remains strictly
+  read-only
 - CACEI evidence generation or any other downstream reporting
 - No weighted categories, course-total/aggregate grades, or the complete
   Moodle gradebook — only real `itemtype='mod'` activities, exactly
@@ -780,9 +931,9 @@ across a full round of requests, including a 404 path.
   is not decided by this repository
 - No incremental extraction (full source re-extraction every run —
   current volume is tiny)
-- No `auth` tables and no API authentication/API keys
-- `GET /health` is unchanged from Phase 0; the API still never queries
-  Moodle or Attendance and never receives their credentials
+- `GET /health` is unchanged from Phase 0 and remains unauthenticated —
+  the API still never queries Moodle or Attendance and never receives
+  their credentials
 
 ## Developer workstation vs. production host
 
@@ -1190,14 +1341,20 @@ completely clean slate.
   enrollments and, since Phase 4, grades — is in production; Attendance's
   is reference material only)
 - Incremental extraction for any pipeline (all are full-extraction only)
-- `auth` tables and API authentication / API keys — no JWT, API keys,
-  OAuth, Telegram auth, `/me`, or role-based access control until Phase 6
-- Public exposure of the API — still localhost/internal only
+- Public exposure of the API — still localhost/internal only; Phase 6
+  added authentication specifically so this can happen safely later,
+  but the Nginx/Cloudflare Tunnel step itself hasn't happened yet
+- A Telegram `/apikey` command or any other bot/Telegram integration
+  with key provisioning — keys are distributed manually for now
+- Usage/audit telemetry (`last_used_at`) and key expiration/scheduled
+  rotation — a key is active until explicitly revoked or rotated
+- Any HTTP endpoint for creating/listing/revoking keys — provisioning
+  is CLI-only (`python -m app.auth.manage_api_keys`)
 - GPA, course averages, attendance percentages, pass/fail status, or risk
-  scores — Phase 5's read API deliberately reports only counts a `COUNT`
+  scores — the read API deliberately reports only counts a `COUNT`
   query can answer correctly; see the README's "No invented aggregates"
 - Absence tracking / an expected-session-roster model
 - Weighted grade categories, the course total/aggregate grades, or any
   other part of Moodle's full gradebook beyond real module activities
 - Historical grade tracking and CACEI evidence generation
-- Admin endpoints and any write/CRUD endpoint of any kind
+- Any write/CRUD endpoint of any kind — every route is strictly read-only

@@ -1,7 +1,9 @@
-"""Phase 5 endpoints must never write to the database — no INSERT/UPDATE/
-DELETE, no side effects, no sync triggers. Proven by hitting every
-endpoint (including a 404 path) and asserting canonical row counts are
-byte-for-byte unchanged.
+"""Phase 5/6 endpoints must never write to the database — no INSERT/
+UPDATE/DELETE, no side effects, no sync triggers, and (since Phase 6)
+authentication itself must not write either (no last_used_at, nothing).
+Proven by hitting every endpoint (including a 404 path and an
+authentication-failure path) and asserting canonical + auth row counts
+are byte-for-byte unchanged.
 """
 
 from datetime import UTC, datetime
@@ -19,6 +21,7 @@ from app.academic.models import (
     Student,
     StudentGrade,
 )
+from app.auth.models import ApiKey
 from tests.api.helpers import (
     create_attendance_record,
     create_attendance_session,
@@ -52,11 +55,12 @@ def _row_counts(engine: Engine) -> dict[str, int]:
             "student_grades": connection.execute(
                 select(func.count()).select_from(StudentGrade)
             ).scalar_one(),
+            "api_keys": connection.execute(select(func.count()).select_from(ApiKey)).scalar_one(),
         }
 
 
-def test_api_requests_do_not_mutate_canonical_tables(
-    client: TestClient, db_engine: Engine
+def test_api_requests_do_not_mutate_canonical_or_auth_tables(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
 ) -> None:
     student_id = create_student(db_engine, account_number="9101")
     course_id = create_course(db_engine)
@@ -72,11 +76,13 @@ def test_api_requests_do_not_mutate_canonical_tables(
 
     before = _row_counts(db_engine)
 
-    client.get(f"/students/{student_id}/courses")
-    client.get(f"/students/{student_id}/attendance")
-    client.get(f"/students/{student_id}/grades")
-    client.get(f"/students/{student_id}/summary")
-    client.get("/students/999999/summary")  # 404 path must not write either
+    client.get(f"/students/{student_id}/courses", headers=admin_headers)
+    client.get(f"/students/{student_id}/attendance", headers=admin_headers)
+    client.get(f"/students/{student_id}/grades", headers=admin_headers)
+    client.get(f"/students/{student_id}/summary", headers=admin_headers)
+    client.get("/students/999999/summary", headers=admin_headers)  # 404 path
+    client.get(f"/students/{student_id}/summary")  # missing key -> 401
+    client.get(f"/students/{student_id}/summary", headers={"X-API-Key": "bogus"})  # 401
 
     after = _row_counts(db_engine)
 

@@ -1,11 +1,13 @@
-"""Phase 5 read-only student endpoints.
+"""Admin-only read-only student endpoints.
 
 Reads canonical academic.* tables only, via
 app.services.student_read_service — never a direct query here, never a
 write, never a connection to Moodle/Attendance or their raw_*/staging
-landing tables. No authentication yet (see the README's Phase 5
-security-boundary section): student_id is an explicit canonical id,
-appropriate only for internal/testing use until Phase 6 adds identity.
+landing tables. Since Phase 6, every route here requires an ADMIN API
+key (app.auth.dependencies.require_admin, applied once at the router
+level below) — a STUDENT key gets 403. Students use /me/* instead
+(app.api.routes.me), where student_id comes from their own credential,
+never from a path parameter.
 """
 
 from fastapi import APIRouter, Depends
@@ -17,10 +19,11 @@ from app.api.schemas.students import (
     StudentGradeResponse,
     StudentSummaryResponse,
 )
+from app.auth.dependencies import require_admin
 from app.db.session import get_db
 from app.services import student_read_service as service
 
-router = APIRouter(prefix="/students", tags=["students"])
+router = APIRouter(prefix="/students", tags=["students"], dependencies=[Depends(require_admin)])
 
 
 @router.get(

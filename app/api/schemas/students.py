@@ -12,6 +12,11 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 
+class StudentIdentityResponse(BaseModel):
+    student_id: int
+    account_number: str
+
+
 class CourseEnrollment(BaseModel):
     course_id: int
     name: str

@@ -4,6 +4,7 @@ from sqlalchemy import engine_from_config, pool
 
 from alembic import context
 from app.academic import models as _academic_models  # noqa: F401  (registers metadata)
+from app.auth import models as _auth_models  # noqa: F401  (registers metadata)
 from app.core.config import get_settings
 from app.db.base import Base
 from app.integration import models as _integration_models  # noqa: F401  (registers metadata)

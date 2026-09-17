@@ -30,6 +30,14 @@ def student_exists(db: Session, student_id: int) -> bool:
     )
 
 
+def get_student_identity(db: Session, student_id: int) -> RowMapping | None:
+    """Minimal identity fields for GET /me — never anything beyond what
+    that response needs (no name, no email, no source mappings).
+    """
+    stmt = select(Student.id, Student.account_number).where(Student.id == student_id)
+    return db.execute(stmt).mappings().one_or_none()
+
+
 def list_enrolled_courses(db: Session, student_id: int) -> Sequence[RowMapping]:
     """One row per course the student is enrolled in, ordered by
     canonical course id for deterministic responses.
