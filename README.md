@@ -27,26 +27,27 @@ Attendance ───────┘
   never depends on Moodle or Attendance being available.
 
 This repository currently implements infrastructure, a database
-foundation, and two ingestion pipelines: Moodle (students, courses,
+foundation, two ingestion pipelines — Moodle (students, courses,
 enrollments, and — since Phase 4 — grade items/student grades) and
 Attendance (attendance sessions/records only — Attendance never creates
-students or courses of its own; see below).
+students or courses of its own; see below) — and, since Phase 5, a
+read-only Academic API over the resulting canonical data.
 
-## Current phase: Phase 4 — Moodle Grades Ingestion
+## Current phase: Phase 5 — Academic Read API
 
 Phase 0 built the project skeleton and shipped a validated production
 deployment (`GET /health` only). Phase 1 added the database foundation.
 Phase 2 added the Moodle ingestion pipeline, now running in production
 every 30 minutes. Phase 3 added a working Attendance ingestion pipeline:
 read-only extraction → `raw_attendance` → `staging` → validation/
-reconciliation → a transactional merge into `academic`. Phase 4 adds
+reconciliation → a transactional merge into `academic`. Phase 4 added
 grade ingestion — grade items and student grades — as part of the same
-Moodle sync process: read-only extraction → `raw_moodle` → `staging` →
-validation/reconciliation → a transactional merge into `academic`, only
-for real, module-backed activities (never the course total or any
-category aggregate). Like the rest of the platform, it is invoked
-manually, as part of the same one-shot command — never scheduled, never
-triggered by the API.
+Moodle sync process, only for real, module-backed activities (never the
+course total or any category aggregate). Phase 5 adds the first product
+read API: four read-only endpoints over `academic.*` (courses,
+attendance, grades, and a conservative summary), explicit canonical
+`student_id`s and no authentication yet — see "Academic read API
+(Phase 5)" below for the full contract and its deliberate limits.
 
 ### Data flow (target architecture)
 
@@ -62,9 +63,9 @@ Source (Moodle / Attendance)
        API
 ```
 
-The Academic API will eventually query **only** `academic`. RAW and
-staging are internal pipeline concerns and must never be queried by the
-API.
+The Academic API queries **only** `academic` (since Phase 5, for the
+four read endpoints below). RAW and staging are internal pipeline
+concerns and are never queried by the API.
 
 ### PostgreSQL schemas
 
@@ -635,20 +636,145 @@ granted `SELECT` on `mdl_grade_items`/`mdl_grade_grades`) and merged
 with the same `academic_ingest_moodle` (now also granted on
 `academic.grade_items`/`academic.student_grades` — see
 `deploy/sql/academic_ingest_moodle_grants.example.sql`) as the primary
-sync. The public API never receives Moodle credentials and, per Phase 4,
-still exposes no grade data at all — see below.
+sync. The public API never receives Moodle credentials; it reads grade
+data only from `academic.*`, via the Phase 5 read API below.
 
-### What Phase 4 does not implement yet
+### Academic read API (Phase 5)
 
-- No academic API endpoints for grades (or anything else) — ingestion
-  records source facts only; Phase 5 builds the read API after both
-  Attendance and Grades are available
+The first product-facing endpoints, over canonical `academic.*` only.
+Implemented in `app/api/routes/students.py` (HTTP layer) →
+`app/services/student_read_service.py` (the one business rule this
+phase owns: "student doesn't exist" vs. "student exists, no records") →
+`app/repositories/student_read_repository.py` (explicit SQLAlchemy
+queries, one per endpoint, no ORM relationship traversal so there's no
+N+1 to worry about) → the Academic PostgreSQL. Response shapes are
+explicit Pydantic models (`app/api/schemas/students.py`) — an ORM
+object is never returned directly, so a column can never leak into the
+API contract by accident.
+
+**No authentication yet — internal/testing use only.** Phase 5
+deliberately has no JWT, API keys, OAuth, Telegram auth, `/me`
+endpoint, or role-based access control; those are Phase 6. Until then,
+`student_id` in the URL is the literal canonical `academic.students.id`
+— acceptable only because the API remains localhost/internal, never
+exposed publicly (same posture as every other phase so far).
+
+**Canonical-data-only.** Every query in
+`student_read_repository.py` reads `academic.*` exclusively — never
+`integration.*` (source mappings, `sync_runs`/`sync_state`/
+`sync_issues`), never `raw_moodle.*`/`raw_attendance.*`/`staging.*`, and
+the API process never imports a Moodle/Attendance source adapter at
+all (`tests/unit/test_api_architecture_isolation.py` asserts this by
+inspecting the actual import statements). A source-system id, a raw
+hash, or any sync-observability field is never present in a response.
+
+**Endpoints** (all `GET`, all read-only, all under `/students/{id}`):
+
+| Endpoint | Reads | Returns |
+|---|---|---|
+| `/courses` | `students`, `enrollments`, `courses` | enrolled courses |
+| `/attendance` | `attendance_sessions`, `attendance_records`, `courses` | recorded attendance events |
+| `/grades` | `grade_items`, `student_grades`, `courses` | canonical grades |
+| `/summary` | all of the above | conservative aggregate counts |
+
+Sample `GET /students/1/grades`:
+
+```json
+{
+  "student_id": 1,
+  "grades": [
+    {
+      "course_id": 1,
+      "grade_item_id": 1,
+      "name": "Tarea 01 — Identificación de Configuration Items",
+      "activity_type": "assign",
+      "grade": 30.0,
+      "max_grade": 100.0
+    }
+  ]
+}
+```
+
+**Unknown vs. empty — the one rule every endpoint follows the same
+way.** An unknown `student_id` (no matching `academic.students` row)
+returns **404** with a consistent body, `{"detail": "Student not
+found"}`, from a single `StudentNotFoundError` exception raised by the
+service layer and caught by one FastAPI exception handler in
+`app/main.py` — never a per-route try/except, never a `200` with an
+empty/null object standing in for "doesn't exist". A student who
+*exists* but has no enrollments/attendance/grades yet is not an error
+at all: **200**, with empty lists and zeroed counts. Distinguishing
+these two cases is the one piece of business logic
+`student_read_service.py` owns; the repository layer only ever answers
+"what rows match", never "does this id mean something."
+
+**`grade`: `null` vs. `0`, never conflated.** Exactly the Phase 4
+invariant, preserved through the API: `null` means not graded yet; `0`
+is a real grade of zero. The repository passes
+`academic.student_grades.grade` through untouched (still nullable);
+the service layer converts `Decimal` → `float` explicitly (`float(x) if
+x is not None else None`) before constructing the response model, so a
+`Decimal` never reaches JSON serialization directly and a `NULL` can
+never be silently coerced to `0.0` by an implicit conversion.
+
+**Attendance semantics — recorded presence only, never inferred
+absence.** `academic.attendance_records` only ever represents a
+positive event: "this student was recorded present at this session."
+There is no absence record and no reliable way, from this schema alone,
+to reconstruct which sessions a student *should* have attended but
+didn't — that would require a full expected-roster/expected-session
+model this phase does not build. Accordingly, `present` in every
+`/attendance` entry is always `true` (included for shape stability, not
+because it varies), and a session the student has no record for simply
+does not appear in the response — it is never synthesized as an
+`"absent"` entry. Consumers must not treat "N events returned" as "N
+out of some total" without an external source of the expected total.
+
+**No invented aggregates.** `/summary` reports only counts a `COUNT`
+query already answers correctly: `courses_count`, `sessions_recorded`,
+`graded_items`/`ungraded_items`. It deliberately does **not** compute a
+GPA, a course average, an attendance percentage, a pass/fail status, or
+a risk score. A course average needs Moodle gradebook aggregation
+semantics (category weights, extra credit, drop-lowest rules) that
+Phase 4 explicitly did not model; an attendance percentage needs a
+correct denominator (the number of sessions a student was *expected* to
+attend), which the canonical schema cannot currently answer safely.
+Both are deferred, not forgotten — see "What Phase 5 does not implement
+yet" below.
+
+**Deterministic ordering.** Every list is ordered explicitly, never left
+to incidental DB/insertion order: courses by `course_id`, attendance
+chronologically by the session's `opened_at` (with `session_id` as a
+tiebreaker), grades by `grade_item_id`. Two identical requests always
+return identical JSON.
+
+**No migration.** Phase 5 is a read layer over the schema
+`0006_grades_ingestion` already delivered — every column every endpoint
+needs already exists. No new table, column, or index was added.
+
+**No write path.** Every repository function issues a `SELECT` only;
+nothing in this phase ever calls `INSERT`/`UPDATE`/`DELETE`, triggers a
+sync, or has any side effect —
+`tests/api/test_read_only.py` proves canonical row counts are unchanged
+across a full round of requests, including a 404 path.
+
+### What Phase 5 does not implement yet
+
+- Authentication of any kind — no JWT, API keys, OAuth, Telegram auth,
+  `/me` endpoint, or role-based access control (Phase 6)
+- Public exposure — the API remains localhost/internal only, exactly
+  like every phase before it
+- GPA, course averages, attendance percentages, pass/fail status, or
+  risk scores — see "No invented aggregates" above for why
+- Absence tracking or any session/roster model that would make an
+  attendance percentage safe to compute
+- CRUD or write endpoints of any kind — Phase 5 is strictly read-only
+- CACEI evidence generation or any other downstream reporting
 - No weighted categories, course-total/aggregate grades, or the complete
   Moodle gradebook — only real `itemtype='mod'` activities, exactly
   "activity name, grade received, maximum grade"
 - No historical grade tracking — a grade change updates the existing
   canonical row in place; there is no audit trail of prior values yet
-- No CACEI evidence generation or any other downstream reporting
 - No cron — scheduling is `deploy/systemd/academic-attendance-sync.timer`
   and `academic-moodle-sync.timer`, example material; production cadence
   is not decided by this repository
@@ -656,8 +782,7 @@ still exposes no grade data at all — see below.
   current volume is tiny)
 - No `auth` tables and no API authentication/API keys
 - `GET /health` is unchanged from Phase 0; the API still never queries
-  Moodle or Attendance and never receives their credentials, and still
-  never exposes any grade, attendance, or academic data
+  Moodle or Attendance and never receives their credentials
 
 ## Developer workstation vs. production host
 
@@ -1065,10 +1190,14 @@ completely clean slate.
   enrollments and, since Phase 4, grades — is in production; Attendance's
   is reference material only)
 - Incremental extraction for any pipeline (all are full-extraction only)
-- `auth` tables and API authentication / API keys
-- Academic API endpoints for any data — grades, attendance, assignments,
-  participation, absence calculations, attendance percentages — ingestion
-  records source facts only; Phase 5 builds the read API
+- `auth` tables and API authentication / API keys — no JWT, API keys,
+  OAuth, Telegram auth, `/me`, or role-based access control until Phase 6
+- Public exposure of the API — still localhost/internal only
+- GPA, course averages, attendance percentages, pass/fail status, or risk
+  scores — Phase 5's read API deliberately reports only counts a `COUNT`
+  query can answer correctly; see the README's "No invented aggregates"
+- Absence tracking / an expected-session-roster model
 - Weighted grade categories, the course total/aggregate grades, or any
   other part of Moodle's full gradebook beyond real module activities
 - Historical grade tracking and CACEI evidence generation
+- Admin endpoints and any write/CRUD endpoint of any kind

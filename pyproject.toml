@@ -42,6 +42,12 @@ extend-exclude = ["build"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "N"]
 
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection pattern calls Depends()/Query()/etc. in an
+# argument default by design (app/api/routes/students.py) — never a real
+# mutable-default bug B008 exists to catch.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Header"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true
