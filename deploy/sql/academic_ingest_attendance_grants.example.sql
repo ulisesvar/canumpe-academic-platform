@@ -31,7 +31,9 @@ GRANT USAGE ON ALL SEQUENCES IN SCHEMA staging TO academic_ingest_attendance;
 -- integration: student_sources (reconciliation mappings, source_system=
 -- 'attendance'), the new attendance_session_sources/
 -- attendance_record_sources, and sync_runs/sync_state. Also needs
--- SELECT on course_sources to resolve the Moodle course mapping.
+-- SELECT on course_sources to resolve the Moodle course mapping, and
+-- SELECT/INSERT/UPDATE on sync_issues to record and later resolve an
+-- unresolved-student issue (see 0005_sync_issues).
 GRANT USAGE ON SCHEMA integration TO academic_ingest_attendance;
 GRANT SELECT, INSERT, UPDATE ON integration.student_sources TO academic_ingest_attendance;
 GRANT SELECT ON integration.course_sources TO academic_ingest_attendance;
@@ -39,12 +41,18 @@ GRANT SELECT, INSERT, UPDATE ON integration.attendance_session_sources TO academ
 GRANT SELECT, INSERT, UPDATE ON integration.attendance_record_sources TO academic_ingest_attendance;
 GRANT SELECT, INSERT, UPDATE ON integration.sync_runs TO academic_ingest_attendance;
 GRANT SELECT, INSERT, UPDATE ON integration.sync_state TO academic_ingest_attendance;
+GRANT SELECT, INSERT, UPDATE ON integration.sync_issues TO academic_ingest_attendance;
 GRANT USAGE ON
     SEQUENCE integration.attendance_session_sources_id_seq,
     SEQUENCE integration.attendance_record_sources_id_seq,
     SEQUENCE integration.sync_runs_id_seq,
     SEQUENCE integration.sync_state_id_seq
     TO academic_ingest_attendance;
+-- sync_issues.id's sequence additionally needs SELECT: this is the exact
+-- grant applied manually to fix production after this role was created
+-- before 0005_sync_issues existed (permission denied for table
+-- integration.sync_issues).
+GRANT USAGE, SELECT ON SEQUENCE integration.sync_issues_id_seq TO academic_ingest_attendance;
 
 -- academic: read-only on students (to reconcile by account_number, and
 -- to enforce the FK on attendance_records) and write on the two new

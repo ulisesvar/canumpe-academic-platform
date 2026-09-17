@@ -27,6 +27,7 @@ FROM base AS test
 RUN pip install .[dev]
 COPY --chown=app:app tests ./tests
 COPY --chown=app:app compose.prod.yml ./
+COPY --chown=app:app deploy ./deploy
 
 USER app
 
