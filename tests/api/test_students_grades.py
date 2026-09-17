@@ -12,7 +12,7 @@ from tests.api.helpers import (
 
 
 def test_grades_endpoint_returns_canonical_grade_items(
-    client: TestClient, db_engine: Engine
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
 ) -> None:
     student_id = create_student(db_engine, account_number="8001")
     course_id = create_course(db_engine)
@@ -27,7 +27,7 @@ def test_grades_endpoint_returns_canonical_grade_items(
         db_engine, grade_item_id=item_id, student_id=student_id, grade=Decimal("30")
     )
 
-    response = client.get(f"/students/{student_id}/grades")
+    response = client.get(f"/students/{student_id}/grades", headers=admin_headers)
 
     assert response.status_code == 200
     body = response.json()
@@ -38,7 +38,9 @@ def test_grades_endpoint_returns_canonical_grade_items(
     assert entry["grade_item_id"] == item_id
 
 
-def test_grade_30_serializes_correctly(client: TestClient, db_engine: Engine) -> None:
+def test_grade_30_serializes_correctly(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
     student_id = create_student(db_engine, account_number="8002")
     course_id = create_course(db_engine)
     item_id = create_grade_item(db_engine, course_id=course_id, max_grade=Decimal("100.00000"))
@@ -46,14 +48,16 @@ def test_grade_30_serializes_correctly(client: TestClient, db_engine: Engine) ->
         db_engine, grade_item_id=item_id, student_id=student_id, grade=Decimal("30.00000")
     )
 
-    response = client.get(f"/students/{student_id}/grades")
+    response = client.get(f"/students/{student_id}/grades", headers=admin_headers)
 
     grade = response.json()["grades"][0]["grade"]
     assert grade == 30
     assert isinstance(grade, int | float)
 
 
-def test_grade_75_serializes_correctly(client: TestClient, db_engine: Engine) -> None:
+def test_grade_75_serializes_correctly(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
     student_id = create_student(db_engine, account_number="8003")
     course_id = create_course(db_engine)
     item_id = create_grade_item(db_engine, course_id=course_id, max_grade=Decimal("100.00000"))
@@ -61,26 +65,28 @@ def test_grade_75_serializes_correctly(client: TestClient, db_engine: Engine) ->
         db_engine, grade_item_id=item_id, student_id=student_id, grade=Decimal("75.00000")
     )
 
-    response = client.get(f"/students/{student_id}/grades")
+    response = client.get(f"/students/{student_id}/grades", headers=admin_headers)
 
     grade = response.json()["grades"][0]["grade"]
     assert grade == 75
     assert isinstance(grade, int | float)
 
 
-def test_null_grade_serializes_as_json_null(client: TestClient, db_engine: Engine) -> None:
+def test_null_grade_serializes_as_json_null(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
     student_id = create_student(db_engine, account_number="8004")
     course_id = create_course(db_engine)
     item_id = create_grade_item(db_engine, course_id=course_id)
     create_student_grade(db_engine, grade_item_id=item_id, student_id=student_id, grade=None)
 
-    response = client.get(f"/students/{student_id}/grades")
+    response = client.get(f"/students/{student_id}/grades", headers=admin_headers)
 
     assert response.json()["grades"][0]["grade"] is None
 
 
 def test_zero_grade_serializes_as_numeric_zero_not_null(
-    client: TestClient, db_engine: Engine
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
 ) -> None:
     student_id = create_student(db_engine, account_number="8005")
     course_id = create_course(db_engine)
@@ -89,14 +95,16 @@ def test_zero_grade_serializes_as_numeric_zero_not_null(
         db_engine, grade_item_id=item_id, student_id=student_id, grade=Decimal("0")
     )
 
-    response = client.get(f"/students/{student_id}/grades")
+    response = client.get(f"/students/{student_id}/grades", headers=admin_headers)
 
     grade = response.json()["grades"][0]["grade"]
     assert grade == 0
     assert grade is not None
 
 
-def test_max_grade_is_returned_correctly(client: TestClient, db_engine: Engine) -> None:
+def test_max_grade_is_returned_correctly(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
     student_id = create_student(db_engine, account_number="8006")
     course_id = create_course(db_engine)
     item_id = create_grade_item(db_engine, course_id=course_id, max_grade=Decimal("100.00000"))
@@ -104,12 +112,14 @@ def test_max_grade_is_returned_correctly(client: TestClient, db_engine: Engine) 
         db_engine, grade_item_id=item_id, student_id=student_id, grade=Decimal("50")
     )
 
-    response = client.get(f"/students/{student_id}/grades")
+    response = client.get(f"/students/{student_id}/grades", headers=admin_headers)
 
     assert response.json()["grades"][0]["max_grade"] == 100
 
 
-def test_activity_name_is_returned_correctly(client: TestClient, db_engine: Engine) -> None:
+def test_activity_name_is_returned_correctly(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
     student_id = create_student(db_engine, account_number="8007")
     course_id = create_course(db_engine)
     item_id = create_grade_item(
@@ -119,7 +129,7 @@ def test_activity_name_is_returned_correctly(client: TestClient, db_engine: Engi
         db_engine, grade_item_id=item_id, student_id=student_id, grade=Decimal("30")
     )
 
-    response = client.get(f"/students/{student_id}/grades")
+    response = client.get(f"/students/{student_id}/grades", headers=admin_headers)
 
     assert (
         response.json()["grades"][0]["name"]
@@ -127,7 +137,9 @@ def test_activity_name_is_returned_correctly(client: TestClient, db_engine: Engi
     )
 
 
-def test_source_ids_are_not_exposed(client: TestClient, db_engine: Engine) -> None:
+def test_source_ids_are_not_exposed(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
     student_id = create_student(db_engine, account_number="8008")
     course_id = create_course(db_engine)
     item_id = create_grade_item(db_engine, course_id=course_id)
@@ -135,7 +147,7 @@ def test_source_ids_are_not_exposed(client: TestClient, db_engine: Engine) -> No
         db_engine, grade_item_id=item_id, student_id=student_id, grade=Decimal("30")
     )
 
-    response = client.get(f"/students/{student_id}/grades")
+    response = client.get(f"/students/{student_id}/grades", headers=admin_headers)
 
     entry = response.json()["grades"][0]
     assert set(entry.keys()) == {
@@ -152,7 +164,9 @@ def test_source_ids_are_not_exposed(client: TestClient, db_engine: Engine) -> No
         assert forbidden not in body_text
 
 
-def test_unrelated_students_grades_are_excluded(client: TestClient, db_engine: Engine) -> None:
+def test_unrelated_students_grades_are_excluded(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
     student_a = create_student(db_engine, account_number="8009")
     student_b = create_student(db_engine, account_number="8010")
     course_id = create_course(db_engine)
@@ -161,14 +175,14 @@ def test_unrelated_students_grades_are_excluded(client: TestClient, db_engine: E
     create_student_grade(db_engine, grade_item_id=item_a, student_id=student_a, grade=Decimal("30"))
     create_student_grade(db_engine, grade_item_id=item_b, student_id=student_b, grade=Decimal("75"))
 
-    response = client.get(f"/students/{student_a}/grades")
+    response = client.get(f"/students/{student_a}/grades", headers=admin_headers)
 
     item_ids = [g["grade_item_id"] for g in response.json()["grades"]]
     assert item_ids == [item_a]
 
 
 def test_grades_are_returned_in_deterministic_order(
-    client: TestClient, db_engine: Engine
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
 ) -> None:
     student_id = create_student(db_engine, account_number="8011")
     course_id = create_course(db_engine)
@@ -180,8 +194,8 @@ def test_grades_are_returned_in_deterministic_order(
             db_engine, grade_item_id=item_id, student_id=student_id, grade=Decimal("50")
         )
 
-    first = client.get(f"/students/{student_id}/grades").json()
-    second = client.get(f"/students/{student_id}/grades").json()
+    first = client.get(f"/students/{student_id}/grades", headers=admin_headers).json()
+    second = client.get(f"/students/{student_id}/grades", headers=admin_headers).json()
 
     returned_ids = [g["grade_item_id"] for g in first["grades"]]
     assert returned_ids == sorted(returned_ids)
@@ -189,11 +203,11 @@ def test_grades_are_returned_in_deterministic_order(
 
 
 def test_grades_endpoint_returns_empty_list_for_student_with_no_grades(
-    client: TestClient, db_engine: Engine
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
 ) -> None:
     student_id = create_student(db_engine, account_number="8012")
 
-    response = client.get(f"/students/{student_id}/grades")
+    response = client.get(f"/students/{student_id}/grades", headers=admin_headers)
 
     assert response.status_code == 200
     assert response.json() == {"student_id": student_id, "grades": []}

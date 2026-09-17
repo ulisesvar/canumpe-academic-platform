@@ -1,15 +1,16 @@
-"""Seed helpers for Phase 5 API tests.
+"""Seed helpers for Phase 5/6 API tests.
 
-Insert directly into academic.* with real, committed transactions — the
-running API process reads through its own separate connection pool
-(app.db.session), so data a test wants the API to see must actually be
-committed, never left in an uncommitted SAVEPOINT.
+Insert directly into academic.*/auth.api_keys with real, committed
+transactions — the running API process reads through its own separate
+connection pool (app.db.session), so data a test wants the API to see
+must actually be committed, never left in an uncommitted SAVEPOINT.
 """
 
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Engine, insert
+from sqlalchemy import Engine, insert, select
+from sqlalchemy.orm import Session as OrmSession
 
 from app.academic.models import (
     AttendanceRecord,
@@ -20,6 +21,8 @@ from app.academic.models import (
     Student,
     StudentGrade,
 )
+from app.auth.api_keys import hash_key, issue_admin_key, issue_student_key, revoke_key
+from app.auth.models import ApiKey
 
 
 def create_student(engine: Engine, *, account_number: str) -> int:
@@ -100,3 +103,25 @@ def create_student_grade(
             .values(grade_item_id=grade_item_id, student_id=student_id, grade=grade)
             .returning(StudentGrade.id)
         ).scalar_one()
+
+
+def issue_test_student_key(engine: Engine, *, account_number: str) -> str:
+    """Reuses app.auth.api_keys.issue_student_key against a Session
+    bound to the real (committed) engine, so the API's own connection
+    pool sees it — never duplicates the issuance logic under test.
+    """
+    with OrmSession(engine) as session:
+        return issue_student_key(session, account_number=account_number).plaintext
+
+
+def issue_test_admin_key(engine: Engine, *, label: str | None = None) -> str:
+    with OrmSession(engine) as session:
+        return issue_admin_key(session, label=label).plaintext
+
+
+def revoke_test_key_by_plaintext(engine: Engine, plaintext: str) -> None:
+    with OrmSession(engine) as session:
+        api_key_id = session.execute(
+            select(ApiKey.id).where(ApiKey.key_hash == hash_key(plaintext))
+        ).scalar_one()
+        revoke_key(session, api_key_id=api_key_id)
