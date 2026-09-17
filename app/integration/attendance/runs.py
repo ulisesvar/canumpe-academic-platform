@@ -74,6 +74,7 @@ def mark_sync_run_success(
             rows_inserted=counters.rows_inserted,
             rows_updated=counters.rows_updated,
             rows_unchanged=counters.rows_unchanged,
+            rows_skipped=counters.rows_skipped,
             completed_at=datetime.now(UTC),
         )
     )

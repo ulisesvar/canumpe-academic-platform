@@ -262,15 +262,50 @@ collecting them by accident.
 **Attendance creates no canonical students or courses.** The canonical
 student population comes from Moodle. An Attendance student reconciles
 to an *existing* `academic.students` row by `account_number` — this
-pipeline never runs `INSERT INTO academic.students`. If an
-`account_number` doesn't resolve to exactly one academic student
-(zero matches, or — structurally prevented by `academic.students`'
-own `UNIQUE(account_number)`, but checked anyway — more than one), the
-whole batch fails rather than creating a student, skipping it, or
-guessing. The mapping itself reuses the existing
-`integration.student_sources` table with `source_system='attendance'` —
-exactly the "moodle / 137 and attendance / 25 both map to
-`academic.students.id = 8`" example from the Phase 1 design.
+pipeline never runs `INSERT INTO academic.students`. The mapping itself
+reuses the existing `integration.student_sources` table with
+`source_system='attendance'` — exactly the "moodle / 137 and attendance
+/ 25 both map to `academic.students.id = 8`" example from the Phase 1
+design. `account_number` resolution has three possible outcomes, and
+only one of them blocks the batch:
+
+| Matches in `academic.students` | Outcome |
+|---|---|
+| Exactly 1 | Normal reconciliation — mapping created/refreshed, that student's attendance records merge. |
+| 0 | **Skip**, not a failure — see below. |
+| More than 1 | Blocking — structurally prevented by `academic.students`' own `UNIQUE(account_number)`, but checked anyway (`app.integration.attendance.validation._reconciliation_issue`). |
+
+**Unresolved students are skipped, not fatal.** An Attendance student
+whose `account_number` doesn't exist in Moodle *yet* must not fail the
+whole batch — that was Phase 3's original behavior and production
+acceptance testing rejected it (one real student existed in Attendance
+before being added to Moodle). Instead, `merge.py`'s
+`_reconcile_students` skips that specific student — no canonical student
+created, no source mapping created — and `_merge_records` skips every
+attendance record belonging to them (`rows_skipped` counts both). Every
+other student/session/record in the batch still merges normally, and the
+run is `SUCCESS`. Because Phase 3 always does a full extraction, the
+very next sync re-attempts this exact reconciliation from scratch: once
+Moodle sync creates that student, the next Attendance sync resolves
+their `account_number`, creates the mapping, and imports their entire
+attendance history — nothing is permanently lost, just delayed.
+
+**Counter semantics** (`integration.sync_runs`, set in
+`app.integration.attendance.sync.run_attendance_sync`):
+
+- `rows_read` — every row extraction returned (students + sessions +
+  attendances), before any check.
+- `rows_valid` — equals `rows_read` whenever `validate_staged_batch`
+  found zero blocking issues for the batch. Validity is a batch-wide,
+  structural/referential judgment (would this batch be safe to attempt
+  merging at all?), independent of whether an individual valid row was
+  actually merged.
+- `rows_skipped` — valid rows deliberately not merged because their
+  canonical anchor doesn't exist yet: an unresolved Attendance student,
+  plus every attendance record belonging to them. Not an error.
+- `rows_inserted`/`rows_updated`/`rows_unchanged` — as in the Moodle
+  pipeline, driven by `source_hash` comparison, counted across students,
+  sessions, and records together.
 
 **Course association through the Moodle mapping.** The Attendance
 source has no course id of its own. `ATTENDANCE_MOODLE_COURSE_ID`
