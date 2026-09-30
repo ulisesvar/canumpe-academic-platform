@@ -555,9 +555,13 @@ grade item, or an individual hidden grade, must never reach
 `academic` without an explicit product decision to expose it — Phase 4
 has no API yet, so the simpler and safer choice is exclusion, not a
 `hidden` column threaded through staging/canonical that a future change
-could accidentally start reading. `hidden` is preserved faithfully in
-`raw_moodle` (a complete, faithful record of what extraction observed),
-but `app.integration.moodle.grades_staging_writer.write_staging_grades_batch`
+could accidentally start reading. What counts as hidden follows Moodle:
+`0` is visible, `1` is hidden always, and any larger value is a Unix
+"hidden until" timestamp, evaluated at the snapshot time
+(`app.integration.moodle.grades_source.is_moodle_hidden`). `raw_moodle`
+keeps every row extraction observed, hidden ones included, and stores that
+evaluated flag in `hidden` — not Moodle's original integer — but
+`app.integration.moodle.grades_staging_writer.write_staging_grades_batch`
 never stages a hidden grade item, and never stages a grade that is
 itself hidden *or* whose parent item is hidden — Moodle's own semantics
 make a hidden item hide every grade under it regardless of any per-grade

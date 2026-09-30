@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS mdl_grade_items (
     itemmodule TEXT,
     itemname TEXT,
     grademax NUMERIC(10, 5) NOT NULL DEFAULT 100,
-    hidden SMALLINT NOT NULL DEFAULT 0,
+    hidden BIGINT NOT NULL DEFAULT 0,
     timemodified BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS mdl_grade_grades (
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS mdl_grade_grades (
     itemid INTEGER NOT NULL,
     userid INTEGER NOT NULL,
     finalgrade NUMERIC(10, 5),
-    hidden SMALLINT NOT NULL DEFAULT 0,
+    hidden BIGINT NOT NULL DEFAULT 0,
     timemodified BIGINT NOT NULL DEFAULT 0
 );
 """
@@ -109,6 +109,12 @@ PIPELINE_TABLES = (
 def create_fake_moodle_schema(engine: Engine) -> None:
     with engine.begin() as connection:
         connection.execute(text(CREATE_TABLES_SQL))
+        # Moodle's grade hidden columns are BIGINT: a value above 1 is a Unix
+        # "hidden until" timestamp. A long-lived local test database may still
+        # hold the earlier SMALLINT tables (CREATE ... IF NOT EXISTS won't
+        # change them), which cannot store a timestamp — a no-op otherwise.
+        for table in ("mdl_grade_items", "mdl_grade_grades"):
+            connection.execute(text(f"ALTER TABLE {table} ALTER COLUMN hidden TYPE BIGINT"))
 
 
 def truncate_fake_moodle_schema(engine: Engine) -> None:

@@ -15,8 +15,11 @@ class RawMoodleGradeItem(Base):
     Extraction only ever selects itemtype='mod' rows (see
     app.integration.moodle.grades_source) — the course total
     (itemtype='course') and category totals never reach RAW. hidden is
-    preserved faithfully here even though staging excludes hidden rows
-    from ever becoming canonical — see the README's hidden-data section.
+    Moodle's 0 / 1 / "hidden until" timestamp evaluated at the snapshot
+    time (see grades_source.is_moodle_hidden) — the evaluated flag, not the
+    original integer — and is kept here even though staging excludes
+    hidden rows from ever becoming canonical; see the README's hidden-data
+    section.
     """
 
     __tablename__ = "grade_items"
