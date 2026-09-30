@@ -133,7 +133,7 @@ def extract_moodle_grades_batch(
     """
     with moodle_engine.connect() as connection, connection.begin():
         connection.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-        snapshot_time = connection.execute(text("SELECT now()")).scalar_one()
+        snapshot_time: datetime = connection.execute(text("SELECT now()")).scalar_one()
 
         grade_items = _fetch_grade_items(connection, course_id)
         student_grades = _fetch_student_grades(connection, course_id)
