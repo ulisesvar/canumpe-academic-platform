@@ -13,6 +13,12 @@ so a grade can never be extracted for an item outside the configured
 course or outside itemtype='mod' — see the README's grade-item filter
 section.
 
+Moodle's `hidden` columns (mdl_grade_items.hidden and mdl_grade_grades.hidden)
+are not booleans: 0 is visible, 1 is hidden always, and any larger number is
+a Unix timestamp meaning "hidden until" that time. `is_moodle_hidden` applies
+that rule at extraction time, so ExtractedGradeItem.hidden and
+ExtractedStudentGrade.hidden mean "hidden at the snapshot" — not "nonzero".
+
 Only the columns academic grading actually needs are selected — never
 rawgrade/rawgrademin/rawgrademax/feedback/information/overridden/
 excluded/aggregation weights/outcomes/scales/grade history/letters. See
@@ -37,6 +43,33 @@ def _epoch_to_datetime(value: int | None) -> datetime | None:
     if not value:
         return None
     return datetime.fromtimestamp(value, tz=UTC)
+
+
+def is_moodle_hidden(hidden: int | None, reference_time: datetime) -> bool:
+    """Whether a Moodle `hidden` value means hidden at `reference_time`.
+
+    Mirrors Moodle's own rule (grade_object::is_hidden, which both
+    grade_item and grade_grade use for their own flag):
+
+        hidden == 1  or  (hidden != 0 and hidden > time())
+
+    so 0 (or NULL) is visible, 1 is hidden always, and any other value is
+    a Unix timestamp the row is hidden *until* — hidden while it is still
+    in the future, visible once it has passed. The comparison is strict
+    (a value equal to the reference second is visible), in whole seconds
+    like Moodle's time(). A negative value is never in the future, so it
+    is visible, as in Moodle.
+
+    reference_time must be timezone-aware; it is passed in, never read
+    from the clock here, so the result is deterministic.
+    """
+    if reference_time.tzinfo is None or reference_time.utcoffset() is None:
+        raise ValueError("reference_time must be timezone-aware")
+    if not hidden:
+        return False
+    if hidden == 1:
+        return True
+    return hidden > int(reference_time.timestamp())
 
 
 @dataclass(frozen=True)
@@ -66,7 +99,9 @@ class MoodleGradesExtractionResult:
     student_grades: Sequence[ExtractedStudentGrade]
 
 
-def _fetch_grade_items(connection: Connection, course_id: int) -> list[ExtractedGradeItem]:
+def _fetch_grade_items(
+    connection: Connection, course_id: int, reference_time: datetime
+) -> list[ExtractedGradeItem]:
     rows = connection.execute(
         text("""
             SELECT id AS source_id, itemname, itemmodule, grademax, hidden, timemodified
@@ -81,14 +116,16 @@ def _fetch_grade_items(connection: Connection, course_id: int) -> list[Extracted
             name=row.itemname,
             itemmodule=row.itemmodule,
             max_grade=row.grademax,
-            hidden=bool(row.hidden),
+            hidden=is_moodle_hidden(row.hidden, reference_time),
             source_updated_at=_epoch_to_datetime(row.timemodified),
         )
         for row in rows
     ]
 
 
-def _fetch_student_grades(connection: Connection, course_id: int) -> list[ExtractedStudentGrade]:
+def _fetch_student_grades(
+    connection: Connection, course_id: int, reference_time: datetime
+) -> list[ExtractedStudentGrade]:
     rows = connection.execute(
         text("""
             SELECT
@@ -112,7 +149,7 @@ def _fetch_student_grades(connection: Connection, course_id: int) -> list[Extrac
             if row.student_source_id is not None
             else None,
             finalgrade=row.finalgrade,
-            hidden=bool(row.hidden),
+            hidden=is_moodle_hidden(row.hidden, reference_time),
             source_updated_at=_epoch_to_datetime(row.timemodified),
         )
         for row in rows
@@ -120,9 +157,14 @@ def _fetch_student_grades(connection: Connection, course_id: int) -> list[Extrac
 
 
 def extract_moodle_grades_batch(
-    moodle_engine: Engine, course_id: int
+    moodle_engine: Engine, course_id: int, reference_time: datetime | None = None
 ) -> MoodleGradesExtractionResult:
     """Extract grade items/grades for one course from Moodle.
+
+    reference_time is the instant "hidden until" timestamps are compared
+    against (see is_moodle_hidden). It defaults to the snapshot time, so
+    production evaluates every row against the same Moodle-side instant;
+    tests pass an explicit, timezone-aware value.
 
     Runs inside a single REPEATABLE READ, READ ONLY transaction — same
     pattern as app.integration.moodle.source.extract_moodle_batch — so
@@ -135,8 +177,9 @@ def extract_moodle_grades_batch(
         connection.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
         snapshot_time: datetime = connection.execute(text("SELECT now()")).scalar_one()
 
-        grade_items = _fetch_grade_items(connection, course_id)
-        student_grades = _fetch_student_grades(connection, course_id)
+        hidden_reference_time = reference_time if reference_time is not None else snapshot_time
+        grade_items = _fetch_grade_items(connection, course_id, hidden_reference_time)
+        student_grades = _fetch_student_grades(connection, course_id, hidden_reference_time)
 
     return MoodleGradesExtractionResult(
         snapshot_time=snapshot_time, grade_items=grade_items, student_grades=student_grades
