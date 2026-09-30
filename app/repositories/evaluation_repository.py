@@ -22,6 +22,7 @@ from app.academic.models import (
     GradeItemEvaluation,
     StudentGrade,
 )
+from app.academic.models.grade_category import CALCULATION_ATTENDANCE_PARTICIPATION
 from app.api.schemas.evaluation_scheme import EvaluationSchemeRequest
 
 
@@ -59,11 +60,24 @@ def list_categories_for_course(db: Session, course_id: int) -> Sequence[RowMappi
             GradeCategory.name,
             GradeCategory.weight_percent,
             GradeCategory.sort_order,
+            GradeCategory.calculation_type,
         )
         .where(GradeCategory.course_id == course_id)
         .order_by(GradeCategory.sort_order, GradeCategory.id)
     )
     return db.execute(stmt).mappings().all()
+
+
+def course_has_attendance_participation_category(db: Session, course_id: int) -> bool:
+    return (
+        db.execute(
+            select(GradeCategory.id).where(
+                GradeCategory.course_id == course_id,
+                GradeCategory.calculation_type == CALCULATION_ATTENDANCE_PARTICIPATION,
+            )
+        ).first()
+        is not None
+    )
 
 
 def list_all_grade_item_assignments_for_course(db: Session, course_id: int) -> Sequence[RowMapping]:
@@ -159,6 +173,7 @@ def replace_course_evaluation_scheme(
                 name=category.name,
                 weight_percent=category.weight_percent,
                 sort_order=category.sort_order,
+                calculation_type=category.calculation_type,
                 updated_at=now,
             )
             .returning(GradeCategory.id)

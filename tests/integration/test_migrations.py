@@ -6,7 +6,8 @@ from tests.conftest import alembic_config
 PHASE1_ACADEMIC_TABLES = {"students", "courses", "enrollments"}
 PHASE3_ACADEMIC_TABLES = PHASE1_ACADEMIC_TABLES | {"attendance_sessions", "attendance_records"}
 PHASE6_ACADEMIC_TABLES = PHASE3_ACADEMIC_TABLES | {"grade_items", "student_grades"}
-ACADEMIC_TABLES = PHASE6_ACADEMIC_TABLES | {"grade_categories", "grade_item_evaluation"}
+PHASE7_ACADEMIC_TABLES = PHASE6_ACADEMIC_TABLES | {"grade_categories", "grade_item_evaluation"}
+ACADEMIC_TABLES = PHASE7_ACADEMIC_TABLES | {"participation_observations"}
 
 PHASE1_INTEGRATION_TABLES = {
     "student_sources",
@@ -244,12 +245,32 @@ def test_downgrade_then_upgrade_is_clean(db_engine: Engine) -> None:
     assert "attendance_sessions" in inspect(db_engine).get_table_names(schema="academic")
     assert "grade_items" in inspect(db_engine).get_table_names(schema="academic")
     assert "grade_categories" in inspect(db_engine).get_table_names(schema="academic")
+    assert "participation_observations" in inspect(db_engine).get_table_names(schema="academic")
     assert "students" in inspect(db_engine).get_table_names(schema="raw_moodle")
     assert "grade_items" in inspect(db_engine).get_table_names(schema="raw_moodle")
     assert "students" in inspect(db_engine).get_table_names(schema="raw_attendance")
     assert "students" in inspect(db_engine).get_table_names(schema="staging")
     assert "grade_items" in inspect(db_engine).get_table_names(schema="staging")
     assert "api_keys" in inspect(db_engine).get_table_names(schema="auth")
+
+
+def test_downgrade_one_step_from_head_removes_only_participation_observations(
+    db_engine: Engine,
+) -> None:
+    cfg = alembic_config()
+
+    try:
+        command.downgrade(cfg, "0008_evaluation_engine")
+        academic_tables = set(inspect(db_engine).get_table_names(schema="academic"))
+        assert academic_tables == PHASE7_ACADEMIC_TABLES
+        assert "participation_observations" not in academic_tables
+        # Everything 0008 and earlier delivered is untouched.
+        assert set(inspect(db_engine).get_table_names(schema="auth")) == AUTH_TABLES
+        assert set(inspect(db_engine).get_table_names(schema="integration")) == INTEGRATION_TABLES
+    finally:
+        command.upgrade(cfg, "head")
+
+    assert "participation_observations" in inspect(db_engine).get_table_names(schema="academic")
 
 
 def test_downgrade_one_step_from_head_removes_only_evaluation_engine(db_engine: Engine) -> None:

@@ -16,6 +16,7 @@ from tests.api.helpers import issue_test_admin_key
 
 TABLES_TO_TRUNCATE = (
     "auth.api_keys",
+    "academic.participation_observations",
     "academic.grade_item_evaluation",
     "academic.grade_categories",
     "academic.student_grades",

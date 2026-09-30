@@ -5,6 +5,7 @@ from app.academic.models.enrollment import Enrollment
 from app.academic.models.grade_category import GradeCategory
 from app.academic.models.grade_item import GradeItem
 from app.academic.models.grade_item_evaluation import GradeItemEvaluation
+from app.academic.models.participation_observation import ParticipationObservation
 from app.academic.models.student import Student
 from app.academic.models.student_grade import StudentGrade
 
@@ -16,6 +17,7 @@ __all__ = [
     "GradeCategory",
     "GradeItem",
     "GradeItemEvaluation",
+    "ParticipationObservation",
     "Student",
     "StudentGrade",
 ]
