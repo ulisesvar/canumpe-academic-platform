@@ -177,7 +177,7 @@ def extract_moodle_batch(moodle_engine: Engine, course_id: int) -> MoodleExtract
     """
     with moodle_engine.connect() as connection, connection.begin():
         connection.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-        snapshot_time = connection.execute(text("SELECT now()")).scalar_one()
+        snapshot_time: datetime = connection.execute(text("SELECT now()")).scalar_one()
 
         students = _fetch_students(connection, course_id)
         courses = _fetch_courses(connection, course_id)
