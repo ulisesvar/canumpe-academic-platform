@@ -121,7 +121,7 @@ def extract_attendance_batch(attendance_engine: Engine) -> AttendanceExtractionR
     """
     with attendance_engine.connect() as connection, connection.begin():
         connection.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-        snapshot_time = connection.execute(text("SELECT now()")).scalar_one()
+        snapshot_time: datetime = connection.execute(text("SELECT now()")).scalar_one()
 
         students = _fetch_students(connection)
         sessions = _fetch_sessions(connection)
