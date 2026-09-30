@@ -20,6 +20,7 @@ from app.academic.models import (
     GradeCategory,
     GradeItem,
     GradeItemEvaluation,
+    ParticipationObservation,
     Student,
     StudentGrade,
 )
@@ -130,15 +131,36 @@ def revoke_test_key_by_plaintext(engine: Engine, plaintext: str) -> None:
 
 
 def create_grade_category(
-    engine: Engine, *, course_id: int, name: str, weight_percent: Decimal | int, sort_order: int
+    engine: Engine,
+    *,
+    course_id: int,
+    name: str,
+    weight_percent: Decimal | int,
+    sort_order: int,
+    calculation_type: str = "GRADE_ITEMS",
 ) -> int:
     with engine.begin() as connection:
         return connection.execute(
             insert(GradeCategory)
             .values(
-                course_id=course_id, name=name, weight_percent=weight_percent, sort_order=sort_order
+                course_id=course_id,
+                name=name,
+                weight_percent=weight_percent,
+                sort_order=sort_order,
+                calculation_type=calculation_type,
             )
             .returning(GradeCategory.id)
+        ).scalar_one()
+
+
+def create_participation_observation(
+    engine: Engine, *, course_id: int, student_id: int, value: int
+) -> int:
+    with engine.begin() as connection:
+        return connection.execute(
+            insert(ParticipationObservation)
+            .values(course_id=course_id, student_id=student_id, value=value)
+            .returning(ParticipationObservation.id)
         ).scalar_one()
 
 

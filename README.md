@@ -35,9 +35,11 @@ over the resulting canonical data (Phase 5), API-key
 authentication/authorization protecting it (Phase 6), and, since
 Phase 7, a weighted evaluation engine that explains a student's current
 grade — evaluation categories, weights, and the calculation itself are
-owned by this platform, never by Moodle.
+owned by this platform, never by Moodle — and, since Phase 8,
+participation observations, an attendance score, and an admin course
+roster and gradebook.
 
-## Current phase: Phase 7 — Weighted Evaluation Engine
+## Current phase: Phase 8 — Attendance, Participation and Course Gradebook
 
 Phase 0 built the project skeleton and shipped a validated production
 deployment (`GET /health` only). Phase 1 added the database foundation.
@@ -61,7 +63,12 @@ configuration this platform owns (never inferred from Moodle, never
 written back to it), and a new calculation layer turns that
 configuration plus the canonical grades already ingested into a fully
 transparent, reconstructable "current grade" — see "Weighted evaluation
-engine (Phase 7)" below.
+engine (Phase 7)" below. Phase 8 lets an admin record participation
+observations, derives an attendance score from CLOSED attendance
+sessions, lets one evaluation category combine the two, and adds an
+admin course roster and a whole-class gradebook — see "Attendance,
+participation and the course gradebook (Phase 8)" below. The current
+Alembic head is `0010_grade_category_calc_type`.
 
 ### Data flow (target architecture)
 
@@ -1245,6 +1252,152 @@ number without being able to check it.
   current-grade fields correctly, but there's no endpoint yet that
   lists which courses are missing a scheme entirely
 
+### Attendance, participation and the course gradebook (Phase 8)
+
+Phase 8 is API-only and admin-only. Every route below requires an ADMIN
+API key (a STUDENT key gets `403`; a missing, invalid or revoked key
+gets the usual `401`). The existing `/me/*` and `/students/{student_id}/*`
+endpoints keep their exact response schemas.
+
+**Participation observations** (`academic.participation_observations`,
+migration `0009_participation_observations`). An observation is one
+manual reading of a student's participation in a course, valued
+`0`, `1`, `2` or `3` (a `CHECK` enforces it; `0` is a real zero). A
+student can have many. The database enforces that the student is
+enrolled in the course (composite foreign key to `academic.enrollments`).
+Nothing derived is stored:
+
+- `participation_average` = arithmetic mean of *all* the student's
+  observations — the number of observations does not matter (`3,3` and
+  `3,3,3,3,3` both average `3`; `3,2,3,3` averages `2.75`)
+- `participation_score_100` = `participation_average / 3 * 100`
+  (`2.75` → `91.67`)
+- no observations → `participation_count` `0` and both values `null` —
+  never `0`
+
+| Method and path | Purpose |
+|---|---|
+| `POST /admin/courses/{course_id}/students/{student_id}/participation` | Record one observation: `{"value": 0-3, "observed_at": optional timezone-aware datetime}` → `201` with the observation and the updated summary |
+| `GET /admin/courses/{course_id}/students/{student_id}/participation` | List the observations plus `participation_count`, `participation_average`, `participation_score_100` |
+| `DELETE /admin/courses/{course_id}/students/{student_id}/participation/{observation_id}` | Hard-delete exactly that observation (mistaken taps are corrected this way) → `200` with the updated summary |
+
+`404` for an unknown course or student, a student not enrolled in the
+course, or (on `DELETE`) an observation that doesn't exist *or* belongs to
+a different course/student. `422` for a value outside `0..3` or a
+non-integer.
+
+**Attendance score.** Attendance is binary per `CLOSED` attendance
+session: a record for the student means present, no record means absent.
+`OPEN` sessions never count.
+`attendance_score_100 = present_closed_sessions / closed_sessions * 100`,
+or `null` when the course has no `CLOSED` sessions (never `0`).
+
+> **Current limitation — attendance eligibility is not implemented.**
+> *Every* `CLOSED` session in the course counts for *every* student.
+> A student who joined late is counted absent for sessions held before
+> they enrolled. `academic.enrollments` has no enrollment start date, so
+> per-session eligibility cannot be derived yet; a nullable
+> `attendance_eligible_from` on enrollments is the planned fix.
+
+**Category calculation type** (migration
+`0010_grade_category_calc_type`, `academic.grade_categories.calculation_type`).
+Every category has an explicit type, never inferred from its name:
+
+- `GRADE_ITEMS` (the default — every existing category) — the Phase 7
+  equal-weight average of the category's assigned grade items, unchanged
+- `ATTENDANCE_PARTICIPATION` — no grade items; the category score is
+  `attendance_score_100 * 0.33 + participation_score_100 * 0.67`
+  (attendance 33%, participation 67% *inside* the category). If either
+  component is `null` the category score is `null` and, exactly like a
+  category with nothing graded, the category is excluded from
+  `evaluated_weight_percent` — a missing component is never replaced by
+  zero, while a real `0` in either component is used as a zero. The
+  category's own share of the course (e.g. 20%) is ordinary
+  configuration, `weight_percent`; it is not hard-coded.
+
+A course has at most one `ATTENDANCE_PARTICIPATION` category (validated,
+and enforced by a partial unique index), and it cannot contain grade
+items.
+
+**`GET/PUT /admin/courses/{course_id}/evaluation-scheme` gained
+`calculation_type`** — the only change to an existing endpoint. It is
+always present in the `GET` response and optional in the `PUT` request
+(default `GRADE_ITEMS`). Because the `PUT` replaces the whole scheme,
+a payload that omits the category would silently destroy it; so if the
+course already has an `ATTENDANCE_PARTICIPATION` category and the
+payload contains none, the `PUT` is rejected with `400` before anything
+is written. Removing that category is not supported yet.
+
+`GET /me/evaluation` and `GET /students/{student_id}/evaluation` keep
+their response schema unchanged. For a course with an
+`ATTENDANCE_PARTICIPATION` category they include it in the existing
+fields (`items` is `[]`; `category_score_100` and `contribution_points`
+carry the result or `null`, and the overall current-grade fields follow
+the normal rules). The attendance/participation breakdown is not exposed
+there — only in the gradebook.
+
+**Course roster** — `GET /admin/courses/{course_id}/students` returns
+`course_id` and the course's students (`student_id`, `account_number`,
+`first_name`, `last_name`, `full_name`), ordered by last name, first
+name, then id. `full_name` is derived (`first_name + " " + last_name`).
+It lists enrollments with `active = true`; note that ingestion currently
+never deactivates enrollments that vanish from Moodle, so this filter
+does not yet hide former students. `404` for an unknown course.
+
+**Course gradebook** — `GET /admin/courses/{course_id}/gradebook`
+returns the whole class in one response, shaped for a wide professor
+spreadsheet:
+
+- `course` and `scheme` (each category: name, `calculation_type`,
+  `weight_percent`, `sort_order`)
+- `columns` — every course grade item (activity id, name, type,
+  `max_grade`, category, `counts_toward_current_grade`), assigned items
+  ordered by category `sort_order` then `GradeItem.id`, unassigned items
+  last (`GradeItem.id` reflects ingestion order, not necessarily Moodle's
+  display order)
+- `students` — for each: identity; one grade cell per column (raw `grade`
+  and `score_100`; `null` is not graded, `0.0` is a real zero);
+  `attendance` (closed / present / absent sessions, `score_100`);
+  `participation` (count, average, `score_100`); an
+  `attendance_participation` block that shows the 33/67 build-up
+  (scores, internal weights, internal contributions, category score,
+  category weight and contribution — `null` for a course without such a
+  category); per-category results; and the overall `weighted_points_earned`,
+  `evaluated_weight_percent`, `current_score_100`, `current_grade_10`
+
+**There is no final grade.** The system reports the *current* grade only
+(`current_grade_10`, over the categories that are currently calculable);
+nothing in the gradebook or anywhere else invents a `final_grade`.
+
+The gradebook runs a constant number of queries per request (the API-key
+lookup plus eight bulk queries: 9 statements for 3 students or 200) and
+evaluates every student in memory with the same pure calculation
+(`app.services.evaluation_service.calculate_student_evaluation`) that
+`GET /students/{student_id}/evaluation` uses, so the two always agree.
+It never loads or evaluates students one at a time.
+
+**Migrations.** `0009_participation_observations` adds only
+`academic.participation_observations`. `0010_grade_category_calc_type`
+adds only `grade_categories.calculation_type` (default `GRADE_ITEMS`, so
+existing rows are backfilled), its `CHECK`, and the one-per-course
+partial unique index. Its revision id is deliberately short:
+`alembic_version.version_num` is `varchar(32)`. Both are additive;
+downgrading `0009` deletes all participation observations and
+downgrading `0010` turns any attendance/participation category into an
+ordinary one, so prefer rolling back the image over the schema.
+
+### What Phase 8 does not implement yet
+
+- Attendance eligibility by enrollment date (see the limitation above),
+  excused absences, or any per-session weighting
+- Deactivating enrollments that disappear from Moodle
+- Removing an `ATTENDANCE_PARTICIPATION` category from a course
+- Editing a participation observation — correct one by deleting it and
+  recording a new one
+- A display order for grade items independent of `GradeItem.id`
+- A final grade, and any UI — there is no admin or professor front end
+  in this repository
+
 ## Developer workstation vs. production host
 
 These are deliberately different environments. Note the one deliberate
@@ -1663,7 +1816,10 @@ completely clean slate.
 - GPA, course averages, attendance percentages, pass/fail status, or risk
   scores — the read API deliberately reports only counts a `COUNT`
   query can answer correctly; see the README's "No invented aggregates"
-- Absence tracking / an expected-session-roster model
+- An expected-session-roster model — Phase 8 derives absence for
+  `CLOSED` sessions (no record = absent) but has no per-student
+  attendance eligibility yet; see "Attendance, participation and the
+  course gradebook (Phase 8)"
 - The complete Moodle gradebook beyond weighted category averaging —
   drop-lowest, extra credit, per-item weights within a category, and
   what-if/projected-grade calculations are all still deferred; see
@@ -1671,7 +1827,7 @@ completely clean slate.
   weighted evaluation
 - Historical grade tracking (including of a calculated current grade)
   and CACEI evidence generation
-- Any UI for editing an evaluation scheme, or any other admin/student
-  dashboard — `PUT /admin/courses/{course_id}/evaluation-scheme`
-  (Phase 7) is the only write endpoint that exists, and it has no UI
-  in front of it yet
+- Any UI for editing an evaluation scheme, recording participation, or
+  any other admin/student dashboard — the admin write endpoints
+  (`PUT /admin/courses/{course_id}/evaluation-scheme` and the Phase 8
+  participation `POST`/`DELETE`) have no UI in front of them yet

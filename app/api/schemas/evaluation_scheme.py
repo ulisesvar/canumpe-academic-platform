@@ -9,8 +9,11 @@ in this API.
 """
 
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+CalculationType = Literal["GRADE_ITEMS", "ATTENDANCE_PARTICIPATION"]
 
 
 class GradeItemAssignmentRequest(BaseModel):
@@ -22,6 +25,15 @@ class CategorySchemeRequest(BaseModel):
     name: str
     weight_percent: Decimal
     sort_order: int
+    calculation_type: CalculationType = Field(
+        default="GRADE_ITEMS",
+        description=(
+            "How the category is scored. Defaults to GRADE_ITEMS, so a payload that omits it "
+            "behaves exactly as before Phase 8.3. An ATTENDANCE_PARTICIPATION category takes "
+            "no grade items, a course has at most one, and a replacement scheme for a course "
+            "that already has one must include one."
+        ),
+    )
     grade_items: list[GradeItemAssignmentRequest] = Field(default_factory=list)
 
 
@@ -41,6 +53,7 @@ class CategoryScheme(BaseModel):
     name: str
     weight_percent: float
     sort_order: int
+    calculation_type: CalculationType
     grade_items: list[GradeItemAssignment]
 
 

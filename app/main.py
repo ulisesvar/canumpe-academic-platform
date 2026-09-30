@@ -10,6 +10,10 @@ from app.services.evaluation_service import (
     InvalidEvaluationSchemeError,
     NoEvaluableCourseError,
 )
+from app.services.participation_service import (
+    ParticipationObservationNotFoundError,
+    StudentNotEnrolledError,
+)
 from app.services.student_read_service import StudentNotFoundError
 
 app = FastAPI(title="CANUMPE Academic Platform", version="0.1.0")
@@ -42,3 +46,15 @@ def _handle_invalid_evaluation_scheme(
     request: Request, exc: InvalidEvaluationSchemeError
 ) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(StudentNotEnrolledError)
+def _handle_student_not_enrolled(request: Request, exc: StudentNotEnrolledError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "Student not enrolled in course"})
+
+
+@app.exception_handler(ParticipationObservationNotFoundError)
+def _handle_participation_observation_not_found(
+    request: Request, exc: ParticipationObservationNotFoundError
+) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "Participation observation not found"})
