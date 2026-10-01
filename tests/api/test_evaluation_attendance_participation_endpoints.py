@@ -210,10 +210,31 @@ def test_grade_items_categories_keep_their_phase_7_numbers(
     assert exams["contribution_points"] is None
 
 
-def test_missing_component_leaves_the_category_null_and_out_of_evaluated_weight(
+def test_no_participation_observations_count_as_zero_in_the_category(
     client: TestClient, db_engine: Engine
 ) -> None:
-    student_id, course_id, key = _seed(db_engine, "8506", observations=())
+    student_id, course_id, key = _seed(db_engine, "8506", observations=())  # attendance 50
+
+    me, admin = _both(client, db_engine, student_id, course_id, key)
+
+    for body in (me, admin):
+        category = _category(body, "Attendance / Participation")
+        assert category["category_score_100"] == 16.5  # 50 * 0.33 + 0 * 0.67
+        assert category["contribution_points"] == 3.3  # 16.5 * 20 / 100
+        assert body["evaluated_weight_percent"] == 60.0  # Tasks 40 + A/P 20
+        assert body["weighted_points_earned"] == 35.3  # 32 + 3.3
+        assert body["current_score_100"] == 58.83  # 35.3 / 60 * 100
+        assert body["current_grade_10"] == 5.88
+    assert me == admin
+
+
+def test_no_closed_attendance_sessions_leave_the_category_null_and_out_of_evaluated_weight(
+    client: TestClient, db_engine: Engine
+) -> None:
+    """Attendance genuinely unavailable stays NULL, whatever the participation."""
+    student_id, course_id, key = _seed(
+        db_engine, "8507", closed_sessions=0, attended=0, observations=(3, 3)
+    )
 
     me, admin = _both(client, db_engine, student_id, course_id, key)
 
