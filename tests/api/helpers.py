@@ -138,6 +138,7 @@ def create_grade_category(
     weight_percent: Decimal | int,
     sort_order: int,
     calculation_type: str = "GRADE_ITEMS",
+    moodle_activity_type: str | None = None,
 ) -> int:
     with engine.begin() as connection:
         return connection.execute(
@@ -148,6 +149,7 @@ def create_grade_category(
                 weight_percent=weight_percent,
                 sort_order=sort_order,
                 calculation_type=calculation_type,
+                moodle_activity_type=moodle_activity_type,
             )
             .returning(GradeCategory.id)
         ).scalar_one()

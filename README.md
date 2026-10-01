@@ -1340,6 +1340,24 @@ carry the result or `null`, and the overall current-grade fields follow
 the normal rules). The attendance/participation breakdown is not exposed
 there — only in the gradebook.
 
+**Moodle activity type → category mapping** (migration
+`0011_category_moodle_activity`, `academic.grade_categories.moodle_activity_type`).
+A category may name the Moodle activity type (`itemmodule`, e.g. `assign`,
+`quiz`) whose grade items belong to it; `NULL` means no automatic mapping,
+and the attendance/participation category never has one. A type maps to at
+most one category per course (validated, and a `UNIQUE (course_id,
+moodle_activity_type)` constraint). After merging a batch's grade items, the
+Moodle sync assigns each item of that batch that has **no assignment yet**
+to its type's category (`counts_toward_current_grade = true`). It never
+changes an existing assignment, items whose type has no configured category
+(e.g. `forum`) stay unassigned, and the match uses only `moodle_activity_type`
+— never a category name or id. The field is optional on the scheme `PUT`
+(omitting it means `NULL`, and the `PUT` replaces the whole scheme, so a
+client that doesn't send it clears the mapping) and is returned by the
+`GET`. The migration backfills today's categories named "Entregables /
+tareas" (`assign`) and "Exámenes" (`quiz`). The sync's database role needs
+the two extra grants listed in `deploy/sql/academic_ingest_moodle_grants.example.sql`.
+
 **Course roster** — `GET /admin/courses/{course_id}/students` returns
 `course_id` and the course's students (`student_id`, `account_number`,
 `first_name`, `last_name`, `full_name`), ordered by last name, first
@@ -1599,8 +1617,10 @@ created by application code (see
 `deploy/sql/academic_ingest_moodle_grants.example.sql` for the exact,
 minimal grants: `raw_moodle`, `staging`, `integration`, and only
 `academic.students`/`academic.courses`/`academic.enrollments`/
-`academic.grade_items`/`academic.student_grades` — no `CREATE`, no
-ownership, no superuser, no `DELETE` on `academic`). The same credential
+`academic.grade_items`/`academic.student_grades`, plus read-only
+`academic.grade_categories` and insert-only `academic.grade_item_evaluation`
+for the category mapping — no `CREATE`, no ownership, no superuser, no
+`DELETE` on `academic`). The same credential
 merges grades since Phase 4 — no second role, no second grants file.
 
 ```

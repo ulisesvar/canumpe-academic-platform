@@ -99,6 +99,14 @@ GRANT SELECT, INSERT, UPDATE ON academic.courses TO academic_ingest_moodle;
 GRANT SELECT, INSERT, UPDATE ON academic.enrollments TO academic_ingest_moodle;
 GRANT SELECT, INSERT, UPDATE ON academic.grade_items TO academic_ingest_moodle;
 GRANT SELECT, INSERT, UPDATE ON academic.student_grades TO academic_ingest_moodle;
+-- Evaluation category mapping: after merging a batch's grade items, the sync
+-- assigns the ones that have no assignment yet to the category the course
+-- configured for their Moodle activity type
+-- (academic.grade_categories.moodle_activity_type). It only READS categories
+-- and only INSERTs missing assignments — never UPDATE or DELETE — so it can
+-- never overwrite an academic decision about an existing assignment.
+GRANT SELECT ON academic.grade_categories TO academic_ingest_moodle;
+GRANT SELECT, INSERT ON academic.grade_item_evaluation TO academic_ingest_moodle;
 GRANT USAGE ON SEQUENCE
     academic.students_id_seq,
     academic.courses_id_seq,

@@ -34,6 +34,14 @@ class CategorySchemeRequest(BaseModel):
             "that already has one must include one."
         ),
     )
+    moodle_activity_type: str | None = Field(
+        default=None,
+        description=(
+            "The Moodle activity type (itemmodule, e.g. 'assign', 'quiz') whose grade items the "
+            "Moodle sync assigns to this category automatically. Optional; omitting it means no "
+            "automatic mapping (NULL). At most one category per course may use a given value."
+        ),
+    )
     grade_items: list[GradeItemAssignmentRequest] = Field(default_factory=list)
 
 
@@ -54,6 +62,7 @@ class CategoryScheme(BaseModel):
     weight_percent: float
     sort_order: int
     calculation_type: CalculationType
+    moodle_activity_type: str | None = None
     grade_items: list[GradeItemAssignment]
 
 

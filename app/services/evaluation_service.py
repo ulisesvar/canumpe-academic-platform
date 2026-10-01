@@ -306,6 +306,7 @@ def get_evaluation_scheme(db: Session, course_id: int) -> EvaluationSchemeRespon
             weight_percent=float(row["weight_percent"]),
             sort_order=row["sort_order"],
             calculation_type=row["calculation_type"],
+            moodle_activity_type=row["moodle_activity_type"],
             grade_items=assignments_by_category.get(row["id"], []),
         )
         for row in category_rows
@@ -343,12 +344,29 @@ def _validate_evaluation_scheme(
     if len(sort_orders) != len(set(sort_orders)):
         raise InvalidEvaluationSchemeError("duplicate sort_order in payload")
 
+    moodle_activity_types = [
+        c.moodle_activity_type for c in payload.categories if c.moodle_activity_type is not None
+    ]
+    duplicated_activity_types = sorted(
+        {t for t in moodle_activity_types if moodle_activity_types.count(t) > 1}
+    )
+    if duplicated_activity_types:
+        raise InvalidEvaluationSchemeError(
+            f"moodle_activity_type {duplicated_activity_types} is used by more than one "
+            "category; a Moodle activity type can map to at most one category per course"
+        )
+
     attendance_participation_categories = [
         c for c in payload.categories if c.calculation_type == CALCULATION_ATTENDANCE_PARTICIPATION
     ]
     if len(attendance_participation_categories) > 1:
         raise InvalidEvaluationSchemeError(
             "at most one ATTENDANCE_PARTICIPATION category is allowed per course"
+        )
+    if any(c.moodle_activity_type is not None for c in attendance_participation_categories):
+        raise InvalidEvaluationSchemeError(
+            "an ATTENDANCE_PARTICIPATION category cannot have a moodle_activity_type "
+            "(it does not come from Moodle)"
         )
     if any(c.grade_items for c in attendance_participation_categories):
         raise InvalidEvaluationSchemeError(
