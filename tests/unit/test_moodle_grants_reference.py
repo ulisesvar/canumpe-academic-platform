@@ -36,6 +36,8 @@ INGEST_REQUIRED_OBJECTS = (
     "academic.enrollments",
     "academic.grade_items",
     "academic.student_grades",
+    "academic.grade_categories",
+    "academic.grade_item_evaluation",
 )
 
 SOURCE_REQUIRED_OBJECTS = (
@@ -51,9 +53,7 @@ SOURCE_REQUIRED_OBJECTS = (
 
 
 def _ingest_grants_text() -> str:
-    return (
-        REPO_ROOT / "deploy" / "sql" / "academic_ingest_moodle_grants.example.sql"
-    ).read_text()
+    return (REPO_ROOT / "deploy" / "sql" / "academic_ingest_moodle_grants.example.sql").read_text()
 
 
 def _source_grants_text() -> str:
@@ -145,3 +145,17 @@ def test_source_grants_reference_is_select_only() -> None:
     for line in grant_lines:
         for verb in ("INSERT", "UPDATE", "DELETE"):
             assert verb not in line.upper(), f"unexpected {verb} in source grant: {line!r}"
+
+
+def test_ingest_grants_reference_gives_the_category_mapping_least_privilege() -> None:
+    """The sync reads categories and inserts missing assignments — nothing more."""
+    content = _ingest_grants_text()
+
+    assert "GRANT SELECT ON academic.grade_categories TO academic_ingest_moodle" in content
+    assert (
+        "GRANT SELECT, INSERT ON academic.grade_item_evaluation TO academic_ingest_moodle"
+        in content
+    )
+    for table in ("grade_categories", "grade_item_evaluation"):
+        assert f"UPDATE ON academic.{table}" not in content
+        assert f"DELETE ON academic.{table}" not in content

@@ -61,6 +61,7 @@ def list_categories_for_course(db: Session, course_id: int) -> Sequence[RowMappi
             GradeCategory.weight_percent,
             GradeCategory.sort_order,
             GradeCategory.calculation_type,
+            GradeCategory.moodle_activity_type,
         )
         .where(GradeCategory.course_id == course_id)
         .order_by(GradeCategory.sort_order, GradeCategory.id)
@@ -174,6 +175,7 @@ def replace_course_evaluation_scheme(
                 weight_percent=category.weight_percent,
                 sort_order=category.sort_order,
                 calculation_type=category.calculation_type,
+                moodle_activity_type=category.moodle_activity_type,
                 updated_at=now,
             )
             .returning(GradeCategory.id)

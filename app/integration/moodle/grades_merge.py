@@ -13,15 +13,24 @@ look up the *existing* mapping created by the Moodle students sync
 (source_system='moodle'); see _resolve_student and the README's grade
 student-resolution section. grade is copied through exactly as staged —
 NULL stays NULL, 0 stays a real zero — never coerced.
+
+After the grade items are merged, the batch's items are also assigned to
+the evaluation category the course configured for their Moodle activity
+type (GradeCategory.moodle_activity_type) — see
+_sync_grade_item_evaluations_by_activity_type. That step only ever creates
+missing grade_item_evaluation rows; it never changes an existing one.
 """
 
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, select, true, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection
 
-from app.academic.models import GradeItem, StudentGrade
+from app.academic.models import GradeCategory, GradeItem, GradeItemEvaluation, StudentGrade
+from app.academic.models.grade_category import CALCULATION_GRADE_ITEMS
 from app.integration.issues import open_issue, resolve_issue
 from app.integration.models import GradeItemSource, StudentGradeSource, StudentSource
 from app.integration.moodle.grades_staging_writer import SOURCE_SYSTEM
@@ -120,6 +129,51 @@ def _merge_grade_items(
             counters.rows_unchanged += 1
 
     return academic_id_by_source_id
+
+
+def _sync_grade_item_evaluations_by_activity_type(
+    connection: Connection, grade_item_ids: Collection[int]
+) -> None:
+    """Assigns this batch's grade items to the evaluation category the
+    course has configured for their Moodle activity type.
+
+    For each given grade item that has NO grade_item_evaluation yet, if its
+    course has a GRADE_ITEMS category whose moodle_activity_type equals the
+    item's activity_type, an evaluation row is created with
+    counts_toward_current_grade = true. Everything else is left alone:
+
+    - an activity type with no configured category (e.g. 'forum') creates
+      nothing — the item stays an unassigned grade item;
+    - an existing grade_item_evaluation is never touched (ON CONFLICT DO
+      NOTHING on its primary key), so the sync can't overwrite an academic
+      decision about which category an item belongs to or whether it counts;
+    - only the given (current batch's) items are considered, never the rest
+      of the course.
+
+    The match is on GradeCategory.moodle_activity_type only — never a
+    category name or id. One INSERT ... SELECT on the caller's connection:
+    same transaction as the rest of the merge, no commit here, and
+    re-running it is a no-op.
+    """
+    if not grade_item_ids:
+        return
+
+    candidates = (
+        select(GradeItem.id, GradeCategory.id, true())
+        .select_from(GradeItem)
+        .join(
+            GradeCategory,
+            (GradeCategory.course_id == GradeItem.course_id)
+            & (GradeCategory.moodle_activity_type == GradeItem.activity_type)
+            & (GradeCategory.calculation_type == CALCULATION_GRADE_ITEMS),
+        )
+        .where(GradeItem.id.in_(grade_item_ids))
+    )
+    connection.execute(
+        pg_insert(GradeItemEvaluation)
+        .from_select(["grade_item_id", "category_id", "counts_toward_current_grade"], candidates)
+        .on_conflict_do_nothing(index_elements=["grade_item_id"])
+    )
 
 
 def _resolve_student(connection: Connection, moodle_user_id: str) -> int | None:
@@ -242,6 +296,9 @@ def merge_grades_batch(
 
     result.grade_item_academic_id_by_source_id = _merge_grade_items(
         connection, now, result.counters, course_id
+    )
+    _sync_grade_item_evaluations_by_activity_type(
+        connection, list(result.grade_item_academic_id_by_source_id.values())
     )
     _merge_student_grades(
         connection, now, result.counters, result.grade_item_academic_id_by_source_id
