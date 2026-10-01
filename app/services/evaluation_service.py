@@ -25,9 +25,10 @@ category score is instead
 
 built from app.services.attendance_score_service (Phase 8.2) and
 app.services.participation_service (Phase 8.1) — neither formula is
-repeated here. If either component is None (no CLOSED sessions / no
-participation observations) the category score is None, never a
-substituted zero (a real 0 in either component is a real zero), and the
+repeated here. Participation without observations is 0 (see
+summarize_participation). If attendance is None (no CLOSED sessions) the
+category score is None, never a substituted zero (a real 0 in either
+component is a real zero), and the
 category is then excluded from evaluated weight exactly like an
 item-based category with nothing graded. The strategy is chosen by the
 category's explicit calculation_type, never by its name.

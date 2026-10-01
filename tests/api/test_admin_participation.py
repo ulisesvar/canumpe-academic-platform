@@ -64,7 +64,7 @@ def test_value_zero_is_valid_and_is_a_real_zero(
     assert body["participation_score_100"] == 0.0
 
 
-def test_no_observations_yields_count_zero_and_null_average_and_score(
+def test_no_observations_yields_count_zero_and_zero_average_and_score(
     client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
 ) -> None:
     course_id, student_id = _enrolled(db_engine, "8202")
@@ -77,8 +77,8 @@ def test_no_observations_yields_count_zero_and_null_average_and_score(
         "course_id": course_id,
         "observations": [],
         "participation_count": 0,
-        "participation_average": None,
-        "participation_score_100": None,
+        "participation_average": 0.0,
+        "participation_score_100": 0.0,
     }
 
 
@@ -277,7 +277,7 @@ def test_delete_removes_only_the_requested_observation_and_recalculates(
     assert _count_rows(db_engine) == 3
 
 
-def test_deleting_the_final_observation_returns_count_zero_and_null_average_and_score(
+def test_deleting_the_final_observation_returns_count_zero_and_zero_average_and_score(
     client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
 ) -> None:
     course_id, student_id = _enrolled(db_engine, "8216")
@@ -292,8 +292,8 @@ def test_deleting_the_final_observation_returns_count_zero_and_null_average_and_
         "student_id": student_id,
         "course_id": course_id,
         "participation_count": 0,
-        "participation_average": None,
-        "participation_score_100": None,
+        "participation_average": 0.0,
+        "participation_score_100": 0.0,
     }
     assert _count_rows(db_engine) == 0
 

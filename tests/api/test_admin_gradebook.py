@@ -302,10 +302,11 @@ def test_participation_summary_and_student_without_observations(
         "participation_average": 2.0,
         "participation_score_100": 66.67,
     }
+    # No observations: participation is 0 (count 0), not null.
     assert _student_row(body, seed["b"])["participation"] == {
         "participation_count": 0,
-        "participation_average": None,
-        "participation_score_100": None,
+        "participation_average": 0.0,
+        "participation_score_100": 0.0,
     }
 
 
@@ -330,7 +331,7 @@ def test_attendance_participation_detail_shows_the_33_67_build_up(
     }
 
 
-def test_attendance_participation_category_is_null_when_participation_is_missing(
+def test_attendance_participation_category_is_zero_when_both_components_are_zero(
     client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
 ) -> None:
     seed = _seed_class(db_engine)
@@ -339,15 +340,51 @@ def test_attendance_participation_category_is_null_when_participation_is_missing
     b = _student_row(body, seed["b"])
     detail = b["attendance_participation"]
 
-    # Attendance exists (a real 0), participation doesn't: the category is NULL, not 0.
+    # Attendance is a real 0 (4 closed sessions, none attended) and there are no participation
+    # observations (= 0): the category is a calculated 0, not NULL.
     assert detail["attendance_score_100"] == 0.0
     assert detail["attendance_contribution_points"] == 0.0
-    assert detail["participation_score_100"] is None
-    assert detail["participation_contribution_points"] is None
-    assert detail["category_score_100"] is None
-    assert detail["category_contribution_points"] is None
+    assert detail["participation_score_100"] == 0.0
+    assert detail["participation_contribution_points"] == 0.0
+    assert detail["category_score_100"] == 0.0
+    assert detail["category_contribution_points"] == 0.0
     ap = _category(b, "Attendance / Participation")
-    assert ap["category_score_100"] is None and ap["contribution_points"] is None
+    assert ap["category_score_100"] == 0.0 and ap["contribution_points"] == 0.0
+
+
+def test_attendance_without_participation_observations_gives_the_33_percent_share(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
+    course_id = create_course(db_engine)
+    _seed_scheme(db_engine, course_id)
+    student_id = create_student(db_engine, account_number="8730")
+    create_enrollment(db_engine, student_id=student_id, course_id=course_id)
+    for n in range(4):
+        session_id = create_attendance_session(
+            db_engine, course_id=course_id, opened_at=T0 + timedelta(days=n), status="CLOSED"
+        )
+        create_attendance_record(
+            db_engine, attendance_session_id=session_id, student_id=student_id, recorded_at=T0
+        )
+
+    student = client.get(_url(course_id), headers=admin_headers).json()["students"][0]
+
+    assert student["participation"] == {
+        "participation_count": 0,
+        "participation_average": 0.0,
+        "participation_score_100": 0.0,
+    }
+    assert student["attendance_participation"] == {
+        "attendance_score_100": 100.0,
+        "attendance_weight_percent": 33.0,
+        "attendance_contribution_points": 33.0,
+        "participation_score_100": 0.0,
+        "participation_weight_percent": 67.0,
+        "participation_contribution_points": 0.0,
+        "category_score_100": 33.0,
+        "category_weight_percent": 20.0,
+        "category_contribution_points": 6.6,
+    }
 
 
 def test_attendance_score_is_null_and_category_null_without_closed_sessions(
@@ -424,17 +461,38 @@ def test_category_contributions_and_overall_grade(
     assert a["current_grade_10"] == 4.98
 
 
-def test_student_with_nothing_evaluable_has_null_current_grade(
+def test_student_with_closed_sessions_but_nothing_else_has_a_zero_current_grade(
     client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
 ) -> None:
+    """Attendance/participation is now always evaluable once the course has CLOSED
+    sessions (no attendance and no participation = a calculated 0), so it counts in the
+    evaluated weight."""
     seed = _seed_class(db_engine)
 
     b = _student_row(client.get(_url(seed["course_id"]), headers=admin_headers).json(), seed["b"])
 
-    assert b["evaluated_weight_percent"] == 0.0
+    assert b["evaluated_weight_percent"] == 20.0
     assert b["weighted_points_earned"] == 0.0
-    assert b["current_score_100"] is None
-    assert b["current_grade_10"] is None
+    assert b["current_score_100"] == 0.0
+    assert b["current_grade_10"] == 0.0
+
+
+def test_student_with_nothing_evaluable_has_null_current_grade(
+    client: TestClient, db_engine: Engine, admin_headers: dict[str, str]
+) -> None:
+    """No grades and no CLOSED sessions: nothing is available, so it stays NULL, not 0."""
+    course_id = create_course(db_engine)
+    _seed_scheme(db_engine, course_id)
+    student_id = create_student(db_engine, account_number="8731")
+    create_enrollment(db_engine, student_id=student_id, course_id=course_id)
+
+    student = client.get(_url(course_id), headers=admin_headers).json()["students"][0]
+
+    assert student["evaluated_weight_percent"] == 0.0
+    assert student["weighted_points_earned"] == 0.0
+    assert student["current_score_100"] is None
+    assert student["current_grade_10"] is None
+    assert student["attendance_participation"]["category_score_100"] is None
 
 
 def test_no_final_grade_is_invented(

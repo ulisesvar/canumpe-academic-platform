@@ -1276,8 +1276,9 @@ Nothing derived is stored:
   `3,3,3,3,3` both average `3`; `3,2,3,3` averages `2.75`)
 - `participation_score_100` = `participation_average / 3 * 100`
   (`2.75` → `91.67`)
-- no observations → `participation_count` `0` and both values `null` —
-  never `0`
+- no observations → `participation_count` `0` and both values `0` — the
+  academic rule is that participation without observations is `0`, so it
+  never leaves the attendance/participation category unevaluated
 
 | Method and path | Purpose |
 |---|---|
@@ -1311,10 +1312,11 @@ Every category has an explicit type, never inferred from its name:
   equal-weight average of the category's assigned grade items, unchanged
 - `ATTENDANCE_PARTICIPATION` — no grade items; the category score is
   `attendance_score_100 * 0.33 + participation_score_100 * 0.67`
-  (attendance 33%, participation 67% *inside* the category). If either
-  component is `null` the category score is `null` and, exactly like a
+  (attendance 33%, participation 67% *inside* the category). Participation
+  without observations counts as `0`. If attendance is `null` (the course
+  has no `CLOSED` sessions) the category score is `null` and, exactly like a
   category with nothing graded, the category is excluded from
-  `evaluated_weight_percent` — a missing component is never replaced by
+  `evaluated_weight_percent` — a missing attendance is never replaced by
   zero, while a real `0` in either component is used as a zero. The
   category's own share of the course (e.g. 20%) is ordinary
   configuration, `weight_percent`; it is not hard-coded.

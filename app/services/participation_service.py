@@ -6,8 +6,12 @@ read time, never stored:
     participation_average   = arithmetic mean of all observation values
     participation_score_100 = (participation_average / 3) * 100
 
-No observations means count 0 and a NULL (None) average and score —
-never a zero; a recorded 0 is a real zero. Every intermediate value is
+No observations means count 0 and an average and score of 0 — the academic
+rule is that participation without observations is 0 (so it never leaves the
+attendance/participation category unevaluated); a recorded 0 is, of course,
+also a real zero. This function is the single source of that rule: the
+participation endpoints, the evaluation and the gradebook all read it from
+here. Every intermediate value is
 a full-precision Decimal; rounding happens only when the response
 objects are built (app.services.grade_normalization.round2), never fed
 back into further arithmetic.
@@ -64,13 +68,13 @@ class ParticipationObservationNotFoundError(Exception):
 @dataclass(frozen=True)
 class ParticipationSummary:
     count: int
-    average: Decimal | None
-    score_100: Decimal | None
+    average: Decimal
+    score_100: Decimal
 
 
 def summarize_participation(values: Sequence[int]) -> ParticipationSummary:
     if not values:
-        return ParticipationSummary(count=0, average=None, score_100=None)
+        return ParticipationSummary(count=0, average=Decimal(0), score_100=Decimal(0))
     average = Decimal(sum(values)) / Decimal(len(values))
     return ParticipationSummary(
         count=len(values),

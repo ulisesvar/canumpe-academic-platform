@@ -252,16 +252,42 @@ def test_number_of_participation_observations_does_not_change_the_category(
     assert five.category_score_100 == two.category_score_100 == 100.0
 
 
-def test_no_participation_observations_makes_the_category_null(db_session: Session) -> None:
+def test_no_participation_observations_count_as_zero_participation(db_session: Session) -> None:
     course_id, student_id = _setup(db_session, "8407")
-    _sessions(db_session, course_id, student_id, closed=10, attended=9)
+    _sessions(db_session, course_id, student_id, closed=10, attended=9)  # attendance 90
 
     category = _category(
         get_student_evaluation(db_session, student_id, course_id), "Attendance / Participation"
     )
 
-    assert category.category_score_100 is None
-    assert category.contribution_points is None
+    assert category.category_score_100 == 29.7  # 90 * 0.33 + 0 * 0.67
+    assert category.contribution_points == 5.94  # 29.7 * 20 / 100
+
+
+def test_full_attendance_and_no_participation_observations_gives_33(db_session: Session) -> None:
+    course_id, student_id = _setup(db_session, "8414")
+    _sessions(db_session, course_id, student_id, closed=4, attended=4)  # attendance 100
+
+    category = _category(
+        get_student_evaluation(db_session, student_id, course_id), "Attendance / Participation"
+    )
+
+    assert category.category_score_100 == 33.0  # 100 * 0.33 + 0 * 0.67
+    assert category.contribution_points == 6.6  # 33 * 20 / 100
+
+
+def test_half_attendance_and_no_participation_observations_gives_16_5(
+    db_session: Session,
+) -> None:
+    course_id, student_id = _setup(db_session, "8415")
+    _sessions(db_session, course_id, student_id, closed=4, attended=2)  # attendance 50
+
+    category = _category(
+        get_student_evaluation(db_session, student_id, course_id), "Attendance / Participation"
+    )
+
+    assert category.category_score_100 == 16.5  # 50 * 0.33 + 0 * 0.67
+    assert category.contribution_points == 3.3  # 16.5 * 20 / 100
 
 
 def test_no_closed_attendance_sessions_makes_the_category_null(db_session: Session) -> None:
@@ -279,7 +305,10 @@ def test_no_closed_attendance_sessions_makes_the_category_null(db_session: Sessi
 
 def test_a_null_category_is_excluded_from_evaluated_weight(db_session: Session) -> None:
     course_id, student_id = _setup(db_session, "8409")
-    _sessions(db_session, course_id, student_id, closed=10, attended=9)  # participation missing
+    # No CLOSED session at all: attendance is genuinely not available, so the category is NULL
+    # even though participation exists.
+    _sessions(db_session, course_id, student_id, closed=0, attended=0, open_=3)
+    _observe(db_session, course_id, student_id, 3, 3)
 
     result = get_student_evaluation(db_session, student_id, course_id)
 
@@ -288,6 +317,47 @@ def test_a_null_category_is_excluded_from_evaluated_weight(db_session: Session) 
     assert result.weighted_points_earned == 32.0
     assert result.current_score_100 == 80.0
     assert result.current_grade_10 == 8.0
+
+
+def test_a_student_with_attendance_and_no_participation_is_evaluated_in_the_aggregates(
+    db_session: Session,
+) -> None:
+    course_id, student_id = _setup(db_session, "8416")
+    _sessions(db_session, course_id, student_id, closed=10, attended=9)  # no observations
+
+    result = get_student_evaluation(db_session, student_id, course_id)
+
+    assert result.evaluated_weight_percent == 60.0  # Tasks 40 + A/P 20 (now evaluable)
+    assert result.weighted_points_earned == 37.94  # 32 + 5.94
+    assert result.current_score_100 == 63.23  # 37.94 / 60 * 100
+    assert result.current_grade_10 == 6.32
+
+
+def test_current_grade_for_a_student_with_tasks_attendance_and_no_participation(
+    db_session: Session,
+) -> None:
+    """Tareas 30, asistencia 100, sin participación (=0), examen 66.66667; pesos 40/20/40."""
+    course_id = _course(db_session)
+    student_id = _student(db_session, "8417", course_id)
+    task = _item(db_session, course_id, "Tarea 01", "30", student_id)
+    exam = _item(db_session, course_id, "Examen 1", "66.66667", student_id)
+    _scheme(db_session, course_id, task, exam)
+    _sessions(db_session, course_id, student_id, closed=7, attended=7)  # attendance 100
+
+    result = get_student_evaluation(db_session, student_id, course_id)
+
+    tasks = _category(result, "Tasks")
+    participation = _category(result, "Attendance / Participation")
+    exams = _category(result, "Exams")
+    # GRADE_ITEMS categories are computed exactly as before.
+    assert (tasks.category_score_100, tasks.contribution_points) == (30.0, 12.0)
+    assert (exams.category_score_100, exams.contribution_points) == (66.67, 26.67)
+    # 100 * 0.33 + 0 * 0.67 = 33; * 20% = 6.60
+    assert (participation.category_score_100, participation.contribution_points) == (33.0, 6.6)
+    assert result.evaluated_weight_percent == 100.0
+    assert result.weighted_points_earned == 45.27  # 12 + 6.6 + 26.666668
+    assert result.current_score_100 == 45.27
+    assert result.current_grade_10 == 4.53
 
 
 def test_once_both_components_exist_the_category_contributes_its_configured_weight(

@@ -87,7 +87,7 @@ def post_participation_observation(
     description=(
         "participation_average is the arithmetic mean of all observations and "
         "participation_score_100 is (average / 3) * 100. With no observations, count is 0 "
-        "and both are null — never 0."
+        "and both are 0 (participation without observations is 0)."
     ),
 )
 def get_participation(

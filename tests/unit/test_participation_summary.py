@@ -8,12 +8,22 @@ from app.services.grade_normalization import round2
 from app.services.participation_service import summarize_participation
 
 
-def test_no_observations_is_null_not_zero() -> None:
+def test_no_observations_is_zero() -> None:
+    """The academic rule: participation without observations is 0 (average 0,
+    score 0), so it never leaves the attendance/participation category unevaluated."""
     summary = summarize_participation([])
 
     assert summary.count == 0
-    assert summary.average is None
-    assert summary.score_100 is None
+    assert summary.average == Decimal(0)
+    assert summary.score_100 == Decimal(0)
+
+
+def test_no_observations_and_a_recorded_zero_give_the_same_score_but_not_the_same_count() -> None:
+    nothing = summarize_participation([])
+    recorded_zero = summarize_participation([0])
+
+    assert nothing.score_100 == recorded_zero.score_100 == Decimal(0)
+    assert (nothing.count, recorded_zero.count) == (0, 1)
 
 
 def test_a_recorded_zero_is_a_real_zero() -> None:

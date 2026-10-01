@@ -5,9 +5,9 @@ GET /admin/courses/{course_id}/gradebook.
 Every number is presentation-rounded `float`, converted from
 full-precision Decimal in app.services.gradebook_service — never
 rounded and then fed back into arithmetic. `None` always means "not
-currently calculable" (a NULL grade, no participation observations, no
-CLOSED attendance sessions, zero evaluated weight) — never coerced to
-0. There is deliberately no final grade: only the current grade
+currently calculable" (a NULL grade, no CLOSED attendance sessions, zero
+evaluated weight) — never coerced to 0. (Participation without observations
+is not one of them: it is 0.) There is deliberately no final grade: only the current grade
 (current_score_100 / current_grade_10) exists in this system.
 """
 
