@@ -89,6 +89,13 @@ class NoEvaluableCourseError(Exception):
         super().__init__(f"student_id={student_id!r} has no single enrolled course to evaluate")
 
 
+class BotStudentNotFoundError(Exception):
+    """Raised by the bot evaluation lookup when the account number is unknown
+    OR the student has no active enrollment in the bot key's course. One
+    exception for both, so the HTTP response cannot tell them apart.
+    """
+
+
 class InvalidEvaluationSchemeError(Exception):
     """Raised when a PUT evaluation-scheme payload fails validation —
     always before any write, so an invalid payload changes nothing.
@@ -180,6 +187,21 @@ def get_student_evaluation(
         item_rows,
         attendance_participation_score_100,
     )
+
+
+def get_bot_student_evaluation(
+    db: Session, course_id: int, account_number: str
+) -> StudentEvaluationResponse:
+    """One student's evaluation for the bot role: the course comes from the
+    bot credential, and the student must have an active enrollment in it.
+    An unknown account number and a student enrolled only elsewhere both
+    raise BotStudentNotFoundError, so the response never reveals which. The
+    numbers come from the same get_student_evaluation as /me and /students.
+    """
+    student_id = student_repo.find_enrolled_student_id(db, account_number, course_id)
+    if student_id is None:
+        raise BotStudentNotFoundError
+    return get_student_evaluation(db, student_id, course_id)
 
 
 def calculate_student_evaluation(

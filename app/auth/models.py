@@ -16,7 +16,8 @@ from app.db.base import Base
 
 ROLE_STUDENT = "student"
 ROLE_ADMIN = "admin"
-API_KEY_ROLES = (ROLE_STUDENT, ROLE_ADMIN)
+ROLE_BOT = "bot"
+API_KEY_ROLES = (ROLE_STUDENT, ROLE_ADMIN, ROLE_BOT)
 
 
 class ApiKey(Base):
@@ -25,8 +26,10 @@ class ApiKey(Base):
     slice of the plaintext kept only for administrative identification
     (see app.auth.api_keys). role='student' rows always reference the
     one canonical student the key authenticates as; role='admin' rows
-    are never tied to a student — both enforced by
-    ck_api_keys_role_student_id_consistency, not just application code.
+    are never tied to a student; role='bot' rows (a server-to-server
+    client) are tied to exactly one course through course_id and never to
+    a student — all enforced by ck_api_keys_role_student_id_consistency,
+    not just application code.
 
     revoked_at is set explicitly by app.auth.api_keys.revoke_key — never
     an ORM/Core `onupdate`, no triggers, same invariant as everywhere
@@ -37,13 +40,15 @@ class ApiKey(Base):
     __tablename__ = "api_keys"
     __table_args__ = (
         UniqueConstraint("key_hash", name="uq_api_keys_key_hash"),
-        CheckConstraint("role IN ('student', 'admin')", name="ck_api_keys_role"),
+        CheckConstraint("role IN ('student', 'admin', 'bot')", name="ck_api_keys_role"),
         CheckConstraint(
-            "(role = 'student' AND student_id IS NOT NULL) OR "
-            "(role = 'admin' AND student_id IS NULL)",
+            "(role = 'student' AND student_id IS NOT NULL AND course_id IS NULL) OR "
+            "(role = 'admin' AND student_id IS NULL AND course_id IS NULL) OR "
+            "(role = 'bot' AND student_id IS NULL AND course_id IS NOT NULL)",
             name="ck_api_keys_role_student_id_consistency",
         ),
         Index("ix_api_keys_student_id", "student_id"),
+        Index("ix_api_keys_course_id", "course_id"),
         Index(
             "uq_api_keys_active_student",
             "student_id",
@@ -59,6 +64,9 @@ class ApiKey(Base):
     role: Mapped[str] = mapped_column(Text, nullable=False)
     student_id: Mapped[int | None] = mapped_column(
         ForeignKey("academic.students.id", ondelete="RESTRICT"), nullable=True
+    )
+    course_id: Mapped[int | None] = mapped_column(
+        ForeignKey("academic.courses.id", ondelete="RESTRICT"), nullable=True
     )
     label: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

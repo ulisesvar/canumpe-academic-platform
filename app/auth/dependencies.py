@@ -19,7 +19,7 @@ from fastapi.security import APIKeyHeader
 from sqlalchemy.orm import Session
 
 from app.auth.api_keys import get_active_key_by_hash, hash_key
-from app.auth.models import ROLE_ADMIN, ROLE_STUDENT, ApiKey
+from app.auth.models import ROLE_ADMIN, ROLE_BOT, ROLE_STUDENT, ApiKey
 from app.db.session import get_db
 
 API_KEY_HEADER_NAME = "X-API-Key"
@@ -77,3 +77,24 @@ def require_student(
         "has a student_id"
     )
     return record.student_id
+
+
+def require_bot(
+    api_key: str | None = Depends(_api_key_header),
+    db: Session = Depends(get_db),
+) -> int:
+    """Authorizes a BOT-role credential and returns the one course_id it
+    is restricted to — resolved exclusively from the credential, never
+    accepted as client input. Backs only the dedicated /bot/* routes; no
+    other router accepts a bot key (require_admin / require_student both
+    reject it with 403).
+    """
+    record = _authenticate(api_key, db)
+    if record.role != ROLE_BOT:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Bot API key required"
+        )
+    assert record.course_id is not None, (
+        "ck_api_keys_role_student_id_consistency guarantees a bot-role row always has a course_id"
+    )
+    return record.course_id

@@ -921,6 +921,35 @@ authentication had to exist and be accepted in production *before* any
 future Nginx/Cloudflare Tunnel exposure, which is a separate
 operational step this phase does not perform.
 
+### Bot role (server-to-server, read-only)
+
+A third credential role, `bot`, exists for a server-side client (the Telegram
+attendance bot) that is not a student and must not hold an admin key. A bot key is
+**restricted to one course** (`auth.api_keys.course_id`, migration
+`0012_bot_api_key_role`; `role='bot'` rows have `course_id` and never a `student_id`,
+enforced by `ck_api_keys_role_student_id_consistency`). Existing student and admin keys
+are unaffected (`course_id` is NULL for them).
+
+| Endpoint | Returns |
+|---|---|
+| `GET /bot/evaluation/{account_number}` | the existing `StudentEvaluationResponse` (same as `GET /me/evaluation`) for that one student, in the key's course |
+
+- The course comes **only** from the key; there is no `course_id` parameter, and none is read.
+- The student must have an **active enrollment** in that course. An unknown account number
+  and a student enrolled only elsewhere return the identical `404 {"detail": "Student not found"}`.
+- No write of any kind. Calculation is the shared `get_student_evaluation`; nothing is recomputed.
+- A bot key gets `403` on `/admin/*`, `/students/*` and `/me/*` (including the whole-course
+  gradebook), and student/admin keys get `403` on `/bot/*`.
+- `account_number` is in the URL path by design; the default uvicorn access log therefore records it.
+
+```bash
+docker compose -f compose.prod.yml run --rm api \
+    python -m app.auth.manage_api_keys issue-bot --course-id 1 --label "telegram-bot"
+```
+
+`issue-bot` fails if the course does not exist, stores only the hash, and prints the plaintext
+key once (`canumpe_bot_<random>`). Revoke with the existing `revoke --id`.
+
 ### What Phase 6 does not implement yet
 
 - Public exposure of the API — still localhost/internal only; that's a

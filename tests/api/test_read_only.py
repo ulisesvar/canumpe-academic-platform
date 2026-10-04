@@ -30,6 +30,7 @@ from tests.api.helpers import (
     create_grade_item,
     create_student,
     create_student_grade,
+    issue_test_bot_key,
 )
 
 T0 = datetime(2026, 3, 1, 9, 0, tzinfo=UTC)
@@ -83,6 +84,32 @@ def test_api_requests_do_not_mutate_canonical_or_auth_tables(
     client.get("/students/999999/summary", headers=admin_headers)  # 404 path
     client.get(f"/students/{student_id}/summary")  # missing key -> 401
     client.get(f"/students/{student_id}/summary", headers={"X-API-Key": "bogus"})  # 401
+
+    after = _row_counts(db_engine)
+
+    assert before == after
+
+
+def test_bot_evaluation_endpoint_does_not_mutate_canonical_or_auth_tables(
+    client: TestClient, db_engine: Engine
+) -> None:
+    student_id = create_student(db_engine, account_number="9102")
+    course_id = create_course(db_engine)
+    create_enrollment(db_engine, student_id=student_id, course_id=course_id)
+    item_id = create_grade_item(db_engine, course_id=course_id)
+    create_student_grade(
+        db_engine, grade_item_id=item_id, student_id=student_id, grade=Decimal("30")
+    )
+    key = issue_test_bot_key(db_engine, course_id=course_id)
+    headers = {"X-API-Key": key}
+
+    before = _row_counts(db_engine)
+
+    client.get("/bot/evaluation/9102", headers=headers)  # 200
+    client.get("/bot/evaluation/no-such-account", headers=headers)  # 404 path
+    client.get("/bot/evaluation/9102")  # missing key -> 401
+    client.get("/bot/evaluation/9102", headers={"X-API-Key": "bogus"})  # 401
+    client.get(f"/students/{student_id}/summary", headers=headers)  # wrong role -> 403
 
     after = _row_counts(db_engine)
 

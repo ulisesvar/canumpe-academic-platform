@@ -22,11 +22,12 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.academic.models import Student
-from app.auth.models import ROLE_ADMIN, ROLE_STUDENT, ApiKey
+from app.academic.models import Course, Student
+from app.auth.models import ROLE_ADMIN, ROLE_BOT, ROLE_STUDENT, ApiKey
 
 STUDENT_KEY_PREFIX = "canumpe_stu_"
 ADMIN_KEY_PREFIX = "canumpe_adm_"
+BOT_KEY_PREFIX = "canumpe_bot_"
 
 #: Characters of the plaintext kept as the stored, non-secret key_prefix.
 #: The role prefix (12 chars) plus a handful of the random secret is
@@ -51,6 +52,14 @@ class ActiveStudentKeyExistsError(Exception):
     def __init__(self, student_id: int) -> None:
         self.student_id = student_id
         super().__init__(f"student_id={student_id!r} already has an active API key")
+
+
+class CourseNotFoundError(Exception):
+    """Raised when a bot key is requested for a course that doesn't exist."""
+
+    def __init__(self, course_id: int) -> None:
+        self.course_id = course_id
+        super().__init__(f"no course with id={course_id!r}")
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,7 @@ class ApiKeySummary:
     key_prefix: str
     role: str
     student_id: int | None
+    course_id: int | None
     account_number: str | None
     label: str | None
     created_at: datetime
@@ -110,6 +120,10 @@ def generate_admin_key() -> KeyMaterial:
     return _generate_key_material(ADMIN_KEY_PREFIX)
 
 
+def generate_bot_key() -> KeyMaterial:
+    return _generate_key_material(BOT_KEY_PREFIX)
+
+
 def _resolve_student_id(db: Session, account_number: str) -> int:
     student_id = db.execute(
         select(Student.id).where(Student.account_number == account_number)
@@ -133,7 +147,13 @@ def _has_active_student_key(db: Session, student_id: int) -> bool:
 
 
 def _insert_key(
-    db: Session, *, material: KeyMaterial, role: str, student_id: int | None, label: str | None
+    db: Session,
+    *,
+    material: KeyMaterial,
+    role: str,
+    student_id: int | None,
+    label: str | None,
+    course_id: int | None = None,
 ) -> GeneratedKey:
     new_id = db.execute(
         insert(ApiKey)
@@ -142,6 +162,7 @@ def _insert_key(
             key_prefix=material.key_prefix,
             role=role,
             student_id=student_id,
+            course_id=course_id,
             label=label,
         )
         .returning(ApiKey.id)
@@ -189,6 +210,27 @@ def issue_admin_key(db: Session, *, label: str | None = None) -> GeneratedKey:
     """
     generated = _insert_key(
         db, material=generate_admin_key(), role=ROLE_ADMIN, student_id=None, label=label
+    )
+    db.commit()
+    return generated
+
+
+def issue_bot_key(db: Session, *, course_id: int, label: str | None = None) -> GeneratedKey:
+    """Issues a server-to-server bot key restricted to ONE course. The
+    course must exist; bot keys have no student_id and may coexist (e.g.
+    during a rotation, until the old one is revoked).
+    """
+    course_exists = db.execute(select(Course.id).where(Course.id == course_id)).first()
+    if course_exists is None:
+        raise CourseNotFoundError(course_id)
+
+    generated = _insert_key(
+        db,
+        material=generate_bot_key(),
+        role=ROLE_BOT,
+        student_id=None,
+        course_id=course_id,
+        label=label,
     )
     db.commit()
     return generated
@@ -251,6 +293,7 @@ def list_keys(db: Session) -> list[ApiKeySummary]:
             ApiKey.key_prefix,
             ApiKey.role,
             ApiKey.student_id,
+            ApiKey.course_id,
             Student.account_number,
             ApiKey.label,
             ApiKey.created_at,
