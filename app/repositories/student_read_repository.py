@@ -32,6 +32,23 @@ def student_exists(db: Session, student_id: int) -> bool:
     )
 
 
+def find_enrolled_student_id(db: Session, account_number: str, course_id: int) -> int | None:
+    """The student_id for this account_number, but ONLY if that student has an
+    active enrollment in this course; None otherwise. One query, so an unknown
+    account number and a student of another course are indistinguishable.
+    """
+    stmt = (
+        select(Student.id)
+        .join(Enrollment, Enrollment.student_id == Student.id)
+        .where(
+            Student.account_number == account_number,
+            Enrollment.course_id == course_id,
+            Enrollment.active.is_(True),
+        )
+    )
+    return db.execute(stmt).scalar_one_or_none()
+
+
 def get_student_identity(db: Session, student_id: int) -> RowMapping | None:
     """Minimal identity fields for GET /me — never anything beyond what
     that response needs (no name, no email, no source mappings).

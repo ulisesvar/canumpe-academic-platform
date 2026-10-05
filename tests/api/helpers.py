@@ -24,7 +24,13 @@ from app.academic.models import (
     Student,
     StudentGrade,
 )
-from app.auth.api_keys import hash_key, issue_admin_key, issue_student_key, revoke_key
+from app.auth.api_keys import (
+    hash_key,
+    issue_admin_key,
+    issue_bot_key,
+    issue_student_key,
+    revoke_key,
+)
 from app.auth.models import ApiKey
 
 
@@ -120,6 +126,11 @@ def issue_test_student_key(engine: Engine, *, account_number: str) -> str:
 def issue_test_admin_key(engine: Engine, *, label: str | None = None) -> str:
     with OrmSession(engine) as session:
         return issue_admin_key(session, label=label).plaintext
+
+
+def issue_test_bot_key(engine: Engine, *, course_id: int, label: str | None = None) -> str:
+    with OrmSession(engine) as session:
+        return issue_bot_key(session, course_id=course_id, label=label).plaintext
 
 
 def revoke_test_key_by_plaintext(engine: Engine, plaintext: str) -> None:

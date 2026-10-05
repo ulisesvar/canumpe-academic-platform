@@ -192,10 +192,11 @@ def test_expected_tables_and_constraints_are_present(db_engine: Engine) -> None:
     api_keys_referred_tables = {
         fk["referred_table"] for fk in inspector.get_foreign_keys("api_keys", schema="auth")
     }
-    assert api_keys_referred_tables == {"students"}
+    assert api_keys_referred_tables == {"students", "courses"}  # course_id: bot role (0012)
 
     api_keys_indexes = {ix["name"] for ix in inspector.get_indexes("api_keys", schema="auth")}
     assert "uq_api_keys_active_student" in api_keys_indexes
+    assert "ix_api_keys_course_id" in api_keys_indexes
 
     grade_categories_unique_columns = {
         tuple(sorted(uc["column_names"]))

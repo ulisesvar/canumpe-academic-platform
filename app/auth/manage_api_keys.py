@@ -8,6 +8,7 @@ host-native Python install required:
         python -m app.auth.manage_api_keys issue-student --account-number 423090349
 
     python -m app.auth.manage_api_keys issue-admin --label "Ulises"
+    python -m app.auth.manage_api_keys issue-bot --course-id 1 --label "telegram-bot"
     python -m app.auth.manage_api_keys revoke --id 3
     python -m app.auth.manage_api_keys rotate-student --account-number 423090349
     python -m app.auth.manage_api_keys list
@@ -22,9 +23,11 @@ import sys
 
 from app.auth.api_keys import (
     ActiveStudentKeyExistsError,
+    CourseNotFoundError,
     GeneratedKey,
     StudentNotFoundError,
     issue_admin_key,
+    issue_bot_key,
     issue_student_key,
     list_keys,
     revoke_key,
@@ -65,6 +68,17 @@ def _issue_admin(args: argparse.Namespace) -> int:
     return 0
 
 
+def _issue_bot(args: argparse.Namespace) -> int:
+    with SessionLocal() as db:
+        try:
+            generated = issue_bot_key(db, course_id=args.course_id, label=args.label)
+        except CourseNotFoundError:
+            print(f"No course found with id={args.course_id!r}", file=sys.stderr)
+            return 1
+    _print_issued("issued bot key", generated)
+    return 0
+
+
 def _revoke(args: argparse.Namespace) -> int:
     with SessionLocal() as db:
         revoke_key(db, api_key_id=args.id)
@@ -89,7 +103,12 @@ def _list(_args: argparse.Namespace) -> int:
     with SessionLocal() as db:
         summaries = list_keys(db)
     for summary in summaries:
-        target = summary.account_number or summary.label or "-"
+        target = (
+            summary.account_number
+            or (f"course_id={summary.course_id}" if summary.course_id is not None else None)
+            or summary.label
+            or "-"
+        )
         state = "revoked" if summary.revoked_at is not None else "active"
         print(
             f"id={summary.id}\tprefix={summary.key_prefix}\trole={summary.role}\t"
@@ -108,6 +127,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     issue_admin = subparsers.add_parser("issue-admin", help="Issue a new admin API key")
     issue_admin.add_argument("--label", default=None)
+
+    issue_bot = subparsers.add_parser(
+        "issue-bot", help="Issue a new bot API key restricted to one course"
+    )
+    issue_bot.add_argument("--course-id", type=int, required=True)
+    issue_bot.add_argument("--label", default=None)
 
     revoke = subparsers.add_parser("revoke", help="Revoke an API key by id")
     revoke.add_argument("--id", type=int, required=True)
@@ -130,6 +155,8 @@ def main() -> int:
         return _issue_student(args)
     if args.command == "issue-admin":
         return _issue_admin(args)
+    if args.command == "issue-bot":
+        return _issue_bot(args)
     if args.command == "revoke":
         return _revoke(args)
     if args.command == "rotate-student":

@@ -3,9 +3,11 @@ from fastapi.responses import JSONResponse
 
 from app.api.health import router as health_router
 from app.api.routes.admin import router as admin_router
+from app.api.routes.bot import router as bot_router
 from app.api.routes.me import router as me_router
 from app.api.routes.students import router as students_router
 from app.services.evaluation_service import (
+    BotStudentNotFoundError,
     CourseNotFoundError,
     InvalidEvaluationSchemeError,
     NoEvaluableCourseError,
@@ -21,10 +23,17 @@ app.include_router(health_router)
 app.include_router(students_router)
 app.include_router(me_router)
 app.include_router(admin_router)
+app.include_router(bot_router)
 
 
 @app.exception_handler(StudentNotFoundError)
 def _handle_student_not_found(request: Request, exc: StudentNotFoundError) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "Student not found"})
+
+
+@app.exception_handler(BotStudentNotFoundError)
+def _handle_bot_student_not_found(request: Request, exc: BotStudentNotFoundError) -> JSONResponse:
+    # Byte-identical to the StudentNotFoundError response on purpose.
     return JSONResponse(status_code=404, content={"detail": "Student not found"})
 
 
